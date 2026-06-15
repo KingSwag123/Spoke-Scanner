@@ -1,0 +1,220 @@
+"""
+Discord routing + delivery.
+
+Decides which game/tier channel a listing belongs to (the WEBHOOKS matrix lives
+in `config`) and renders + posts the rich Discord embeds. Routing needs the
+graded-slab classifier, which it imports from `api_engines`.
+"""
+
+from datetime import datetime, timezone
+
+import requests
+
+from config import (
+    _CHANNEL_COLORS,
+    GAME_DISPLAY,
+    PREMIUM_THRESHOLD,
+    WEBHOOK_PLACEHOLDER,
+    WEBHOOKS,
+)
+from api_engines import is_graded_slab
+
+
+# ---------------------------------------------------------------------------
+# Webhook routing matrix helpers
+# ---------------------------------------------------------------------------
+
+def webhook_is_set(url: str) -> bool:
+    """A slot is usable only if it holds a real URL (not blank / placeholder)."""
+    return bool(url) and url.strip() != "" and url.strip() != WEBHOOK_PLACEHOLDER
+
+
+def determine_channel(
+    game_name: str,
+    title: str,
+    sealed: bool,
+    market_price: float | None = None,
+) -> tuple[str, str]:
+    """
+    Resolve (channel_name, webhook_url) for a listing using the spec precedence:
+      1) sealed product                       → that game's 'sealed' channel
+      2) graded slab OR market >= PREMIUM_THRESHOLD → that game's 'premium' channel
+      3) single, market <  PREMIUM_THRESHOLD  → that game's 'budget' channel
+    Graded slabs (PSA/BGS/CGC/…) always route to premium regardless of price;
+    other singles route by the card's live market price. The URL may be
+    empty/placeholder; callers must check webhook_is_set().
+    """
+    slots = WEBHOOKS.get(game_name, {})
+    if sealed:
+        channel = "sealed"
+    elif is_graded_slab(title) or (market_price is not None and market_price >= PREMIUM_THRESHOLD):
+        channel = "premium"
+    else:
+        channel = "budget"
+    return channel, slots.get(channel, "")
+
+
+# ---------------------------------------------------------------------------
+# Discord alert — rich embed (listing price, shipping, market, % discount)
+# ---------------------------------------------------------------------------
+
+def _post_embed(webhook_url: str, embed: dict, channel: str, game_name: str) -> bool:
+    """POST a single embed; return True only on confirmed 2xx delivery."""
+    try:
+        resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        resp.raise_for_status()
+        print(f"  [OK] Discord embed sent → #{game_name}/{channel}")
+        return True
+    except requests.RequestException as e:
+        print(f"  [ERROR] Discord alert failed (#{game_name}/{channel}): {e}")
+        return False
+
+
+def send_discord_alert(
+    title: str,
+    url: str,
+    listing_price: float,
+    shipping: float,
+    market_price: float,
+    webhook_url: str,
+    channel: str,
+    game_name: str,
+    store: str = "eBay",
+    condition: str = "Not specified",
+    language: str = "Unknown",
+    image_url: str = "",
+    matched_name: str | None = None,
+) -> bool:
+    total    = listing_price + shipping
+    diff     = market_price - total
+    pct      = (diff / market_price * 100) if market_price else 0.0
+    color    = _CHANNEL_COLORS.get(channel, 0x00C805)
+    ship_str = "free shipping" if shipping <= 0 else f"+ ${shipping:.2f} ship"
+    game     = GAME_DISPLAY.get(game_name, game_name.title())
+
+    price_row = [
+        {"name": "💰  Listing Price", "value": f"# ${listing_price:.2f}\n*{ship_str}*", "inline": True},
+        {"name": "📊  TCGplayer Market Price", "value": f"${market_price:.2f}", "inline": True},
+        {"name": "💸  Discount", "value": f"✅  **Save ${diff:.2f}  ({pct:.0f}%)**", "inline": True},
+    ]
+
+    divider  = {"name": "\u200b", "value": "\u200b", "inline": False}
+    meta_row = [
+        {"name": "🎮  Game",      "value": game,      "inline": True},
+        {"name": "🏪  Store",     "value": store,      "inline": True},
+        {"name": "📦  Condition", "value": condition,  "inline": True},
+    ]
+    if language and language not in ("Unknown", "English"):
+        meta_row.append({"name": "🌐  Language", "value": language, "inline": True})
+    if matched_name:
+        meta_row.append({"name": "🃏  Matched", "value": matched_name, "inline": True})
+
+    embed = {
+        "title":       f"🏷️  {game} Deal — " + ("Graded Slab" if is_graded_slab(title) else "Raw Single"),
+        "description": f"### [{title}]({url})",
+        "url":         url,
+        "color":       color,
+        "fields":      price_row + [divider] + meta_row,
+        "footer":      {"text": f"#{game_name}/{channel}  •  Open-Market Engine"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+    if image_url:
+        embed["thumbnail"] = {"url": image_url}
+
+    return _post_embed(webhook_url, embed, channel, game_name)
+
+
+def send_sealed_alert(
+    title: str,
+    url: str,
+    listing_price: float,
+    shipping: float,
+    market_price: float,
+    webhook_url: str,
+    game_name: str,
+    store: str = "eBay",
+    condition: str = "Not specified",
+    language: str = "Unknown",
+    image_url: str = "",
+    matched_name: str | None = None,
+) -> bool:
+    """Sealed-product deal alert — same market/discount layout as singles."""
+    total    = listing_price + shipping
+    diff     = market_price - total
+    pct      = (diff / market_price * 100) if market_price else 0.0
+    color    = _CHANNEL_COLORS.get("sealed", 0x3498DB)
+    ship_str = "free shipping" if shipping <= 0 else f"+ ${shipping:.2f} ship"
+    game     = GAME_DISPLAY.get(game_name, game_name.title())
+
+    price_row = [
+        {"name": "💰  Listing Price", "value": f"# ${listing_price:.2f}\n*{ship_str}*", "inline": True},
+        {"name": "📊  TCGplayer Market Price", "value": f"${market_price:.2f}", "inline": True},
+        {"name": "💸  Discount", "value": f"✅  **Save ${diff:.2f}  ({pct:.0f}%)**", "inline": True},
+    ]
+
+    divider  = {"name": "\u200b", "value": "\u200b", "inline": False}
+    meta_row = [
+        {"name": "🎮  Game",      "value": game,      "inline": True},
+        {"name": "🏪  Store",     "value": store,      "inline": True},
+        {"name": "📦  Condition", "value": condition,  "inline": True},
+    ]
+    if language and language not in ("Unknown", "English"):
+        meta_row.append({"name": "🌐  Language", "value": language, "inline": True})
+    if matched_name:
+        meta_row.append({"name": "🃏  Matched", "value": matched_name, "inline": True})
+
+    embed = {
+        "title":       f"📦  {game} Deal — Sealed Product",
+        "description": f"### [{title}]({url})",
+        "url":         url,
+        "color":       color,
+        "fields":      price_row + [divider] + meta_row,
+        "footer":      {"text": f"#{game_name}/sealed  •  Open-Market Engine"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+    if image_url:
+        embed["thumbnail"] = {"url": image_url}
+
+    return _post_embed(webhook_url, embed, "sealed", game_name)
+
+
+def send_restock_alert(
+    title: str,
+    url: str,
+    price: float,
+    currency: str,
+    webhook_url: str,
+    game_name: str,
+    store_name: str,
+    language: str = "Unknown",
+    image_url: str = "",
+) -> bool:
+    """Sealed-product restock alert — fires when an out-of-stock retail item
+    comes back in stock at a Shopify store. Unlike the deal alerts this shows the
+    retail price in the store's own currency and makes NO market/discount claim
+    (retail restocks aren't necessarily below market — the value is availability).
+    Routes to the game's #sealed channel."""
+    color = _CHANNEL_COLORS.get("restock", 0x1ABC9C)
+    game  = GAME_DISPLAY.get(game_name, game_name.title())
+
+    meta_row = [
+        {"name": "🎮  Game",  "value": game,                      "inline": True},
+        {"name": "🏪  Store", "value": store_name or "Shopify",   "inline": True},
+        {"name": "💵  Retail Price", "value": f"{price:.2f} {currency}", "inline": True},
+    ]
+    if language and language not in ("Unknown", "English"):
+        meta_row.append({"name": "🌐  Language", "value": language, "inline": True})
+
+    embed = {
+        "title":       f"🔄  {game} Restock — Back in Stock",
+        "description": f"### [{title}]({url})",
+        "url":         url,
+        "color":       color,
+        "fields":      meta_row,
+        "footer":      {"text": f"#{game_name}/sealed  •  Retail Restock Watch"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+    if image_url:
+        embed["thumbnail"] = {"url": image_url}
+
+    return _post_embed(webhook_url, embed, "sealed", game_name)
