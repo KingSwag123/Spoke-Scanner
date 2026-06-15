@@ -131,7 +131,16 @@ SHOPIFY_STORES = [
     {"domain": "totalcards.net",     "name": "Total Cards",          "currency": "GBP", "game": None},
     # Non-USD stores are restock-only — uncomment / add with their currency:
     # {"domain": "hairyt.com",         "name": "Hairy Tarantula",    "currency": "CAD", "game": None},
-    # {"domain": "cardmerchant.co.nz", "name": "Card Merchant NZ",   "currency": "NZD", "game": None},
+    # Additional verified Shopify TCG retailers (live /products.json confirmed):
+    {"domain": "skyfoxgames.com",          "name": "Sky Fox Games",           "currency": "USD", "game": None},
+    {"domain": "cardmerchant.co.nz",       "name": "Card Merchant NZ",        "currency": "NZD", "game": None},
+    {"domain": "gameknight.ca",            "name": "Game Knight",             "currency": "CAD", "game": None},
+    {"domain": "everythinggames.ca",       "name": "Everything Games",        "currency": "CAD", "game": None},
+    {"domain": "enterthebattlefield.ca",   "name": "Enter the Battlefield",   "currency": "CAD", "game": None},
+    {"domain": "mythicstore.ca",           "name": "Mythic Store",            "currency": "CAD", "game": None},
+    {"domain": "levelupgames.ca",          "name": "Level Up Games",          "currency": "CAD", "game": None},
+    {"domain": "gamezilla.ca",             "name": "Gamezilla",               "currency": "CAD", "game": None},
+    {"domain": "trinityhobby.ca",          "name": "Trinity Hobby",           "currency": "CAD", "game": None},
 ]
 
 # ---------------------------------------------------------------------------
