@@ -1,3 +1,4 @@
+"""
 Multi-Game Open-Market Dynamic Lookup Engine
 --------------------------------------------
 Monitors broad "Buy It Now" streams of newly-listed TCG listings on eBay across
