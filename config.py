@@ -129,8 +129,7 @@ SHOPIFY_STORES = [
     {"domain": "store.401games.ca",  "name": "401 Games",            "currency": "CAD", "game": None},
     {"domain": "facetofacegames.com","name": "Face to Face Games",   "currency": "CAD", "game": None},
     {"domain": "totalcards.net",     "name": "Total Cards",          "currency": "GBP", "game": None},
-    # Non-USD stores are restock-only — uncomment / add with their currency:
-    # {"domain": "hairyt.com",         "name": "Hairy Tarantula",    "currency": "CAD", "game": None},
+    # Non-USD stores are restock-only (deal test skipped; prices not USD-comparable).
     # Additional verified Shopify TCG retailers (live /products.json confirmed):
     {"domain": "skyfoxgames.com",          "name": "Sky Fox Games",           "currency": "USD", "game": None},
     {"domain": "cardmerchant.co.nz",       "name": "Card Merchant NZ",        "currency": "NZD", "game": None},
@@ -141,6 +140,21 @@ SHOPIFY_STORES = [
     {"domain": "levelupgames.ca",          "name": "Level Up Games",          "currency": "CAD", "game": None},
     {"domain": "gamezilla.ca",             "name": "Gamezilla",               "currency": "CAD", "game": None},
     {"domain": "trinityhobby.ca",          "name": "Trinity Hobby",           "currency": "CAD", "game": None},
+    # Batch 3 — verified live AND reliably reachable from this datacenter IP (restock-only, CAD):
+    {"domain": "hobbiesville.com",         "name": "Hobbiesville",            "currency": "CAD", "game": None},
+    {"domain": "hairyt.com",               "name": "Hairy Tarantula",         "currency": "CAD", "game": None},
+    {"domain": "blackknightgames.ca",      "name": "Black Knight Games",      "currency": "CAD", "game": None},
+    {"domain": "fusiongamingonline.com",   "name": "Fusion Gaming Online",    "currency": "CAD", "game": None},
+    {"domain": "gamebreakers.ca",          "name": "Game Breakers",           "currency": "CAD", "game": None},
+    {"domain": "untouchables.ca",          "name": "Untouchables",            "currency": "CAD", "game": None},
+    {"domain": "vortexgames.ca",           "name": "Vortex Games",            "currency": "CAD", "game": None},
+    # Verified to HAVE a live /products.json, but their Cloudflare returns 429 to this
+    # datacenter IP on every request (tested at limit=50 and 250, scanner idle). They
+    # would only add dead weight here — re-add ONLY behind residential proxies:
+    #   USD: cardsmiths.com, collectorstore.com, gamekastle.com, gnomegames.com,
+    #        potomacdistribution.com, thecardvault.com, thegamersden.com, yourplaymat.com
+    #   GBP: goblingaming.co.uk, leisuregames.com
+    #   AUD: guf.com.au, goodgames.com.au, gamesportal.com.au, topdeckgames.com.au
 ]
 
 # ---------------------------------------------------------------------------
