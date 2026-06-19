@@ -32,6 +32,7 @@ The eBay-only seller-trust gate is skipped for source != "ebay" in main.
 """
 
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +44,7 @@ import requests
 from config import (
     _HTTP_HEADERS,
     MIN_PRICE_FLOOR,
+    RESIDENTIAL_PROXY_URL,
     SHOPIFY_AVAILABILITY_FILE,
     SHOPIFY_GLOBAL_MIN_INTERVAL,
     SHOPIFY_MAX_PAGES,
@@ -51,6 +53,7 @@ from config import (
     SHOPIFY_REQUEST_INTERVAL,
     SHOPIFY_STATE_EXPIRY_DAYS,
     SHOPIFY_TIMEOUT,
+    shopify_proxies,
 )
 from api_engines import detect_language, is_sealed
 
@@ -88,24 +91,45 @@ def _product_image(product: dict) -> str:
     return ""
 
 
-# A rate limiter shared by ALL fetch threads. Most stores run on Shopify, which
+# Proxy connection/auth errors raised by requests/urllib3 can embed the full
+# RESIDENTIAL_PROXY_URL — including user:pass credentials — in their message.
+# Redact any embedded credentials before an exception is ever logged.
+_CREDENTIAL_RE = re.compile(r"(\w+://)[^/\s@]+@")
+
+
+def _safe_err(e: Exception) -> str:
+    """`Type: message` for logging, with the proxy URL / any embedded
+    credentials (scheme://user:pass@host) redacted so secrets never hit logs."""
+    msg = str(e)
+    if RESIDENTIAL_PROXY_URL:
+        msg = msg.replace(RESIDENTIAL_PROXY_URL, "<proxy>")
+    msg = _CREDENTIAL_RE.sub(r"\1<redacted>@", msg)
+    return f"{type(e).__name__}: {msg}"
+
+
+# Rate limiters shared by ALL fetch threads. Most stores run on Shopify, which
 # throttles /products.json by SOURCE IP across stores — so spacing requests within
 # a single store (SHOPIFY_REQUEST_INTERVAL) is not enough once many stores fetch
 # concurrently. This caps the AGGREGATE request rate from this process so scaling
 # to many concurrent stores does not trip 429s.
-_rate_lock = threading.Lock()
-_last_request_ts = 0.0
+#
+# Direct and proxied requests get SEPARATE limiters: direct requests all egress
+# from this one datacenter IP (Cloudflare rate-limits by source IP across every
+# store), while proxied requests egress through a rotating residential IP that
+# does not share that bottleneck — so the proxied stores fetch as a parallel
+# stream and never steal request slots from the direct-path stores.
+_DIRECT_STREAM = {"lock": threading.Lock(), "last": 0.0}
+_PROXY_STREAM  = {"lock": threading.Lock(), "last": 0.0}
 
 
-def _throttle() -> None:
-    """Block until SHOPIFY_GLOBAL_MIN_INTERVAL has elapsed since the last Shopify
-    request started, measured across every thread."""
-    global _last_request_ts
-    with _rate_lock:
-        wait = SHOPIFY_GLOBAL_MIN_INTERVAL - (time.monotonic() - _last_request_ts)
+def _throttle(stream: dict) -> None:
+    """Block until SHOPIFY_GLOBAL_MIN_INTERVAL has elapsed since the last request
+    on this stream (direct or proxied) started, measured across every thread."""
+    with stream["lock"]:
+        wait = SHOPIFY_GLOBAL_MIN_INTERVAL - (time.monotonic() - stream["last"])
         if wait > 0:
             time.sleep(wait)
-        _last_request_ts = time.monotonic()
+        stream["last"] = time.monotonic()
 
 
 def fetch_shopify_listings(store: dict) -> list[dict]:
@@ -120,21 +144,25 @@ def fetch_shopify_listings(store: dict) -> list[dict]:
     currency = store.get("currency", "USD")
     fixed    = store.get("game")
     name     = store.get("name", domain)
+    proxied  = bool(store.get("proxy"))
+    proxies  = shopify_proxies() if proxied else None
+    stream   = _PROXY_STREAM if proxied else _DIRECT_STREAM
 
     listings: list[dict] = []
     for page in range(1, SHOPIFY_MAX_PAGES + 1):
         try:
-            _throttle()
+            _throttle(stream)
             resp = requests.get(
                 f"https://{domain}/products.json",
                 headers=_HTTP_HEADERS,
                 params={"limit": SHOPIFY_PAGE_LIMIT, "page": page},
                 timeout=SHOPIFY_TIMEOUT,
+                proxies=proxies,
             )
             resp.raise_for_status()
             products = resp.json().get("products", [])
         except (requests.RequestException, ValueError) as e:
-            print(f"  [SHOPIFY][ERROR] {name} p{page} — {type(e).__name__}: {e}")
+            print(f"  [SHOPIFY][ERROR] {name} p{page} — {_safe_err(e)}")
             break
         if not products:
             break
@@ -199,6 +227,17 @@ def fetch_all_shopify_listings(stores: list[dict]) -> list[dict]:
     """
     if not stores:
         return []
+    # Proxy-only stores are unreachable from the bare datacenter IP. When no
+    # RESIDENTIAL_PROXY_URL is configured, skip them outright rather than burning
+    # a guaranteed-429 request on each one every cycle.
+    if shopify_proxies() is None:
+        proxy_only = [s for s in stores if s.get("proxy")]
+        if proxy_only:
+            stores = [s for s in stores if not s.get("proxy")]
+            print(f"  [SHOPIFY] {len(proxy_only)} proxy-only store(s) skipped — "
+                  f"set RESIDENTIAL_PROXY_URL to enable them")
+    if not stores:
+        return []
     workers = min(SHOPIFY_MAX_WORKERS, len(stores))
     listings: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="shopify") as pool:
@@ -209,7 +248,7 @@ def fetch_all_shopify_listings(stores: list[dict]) -> list[dict]:
                 listings.extend(fut.result())
             except Exception as e:  # defensive — per-store errors are handled inside
                 name = store.get("name", store.get("domain", "?"))
-                print(f"  [SHOPIFY][ERROR] {name} — gather failed: {type(e).__name__}: {e}")
+                print(f"  [SHOPIFY][ERROR] {name} — gather failed: {_safe_err(e)}")
     return listings
 
 

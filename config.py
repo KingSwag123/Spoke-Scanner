@@ -107,6 +107,25 @@ SHOPIFY_GLOBAL_MIN_INTERVAL = 0.5  # min seconds between ANY two Shopify request
                                    # ~250 req/cycle (~50 stores × 5 pages) is the practical ceiling
                                    # within the 5-min window.
 
+# ---------------------------------------------------------------------------
+# Residential proxy (optional) — unlocks the Cloudflare-strict stores that 429
+# this datacenter IP on every request. Set RESIDENTIAL_PROXY_URL to a rotating
+# residential proxy endpoint, e.g. "http://user:pass@gateway.provider.com:7000".
+# Stores marked {"proxy": True} fetch through it as a SEPARATE request stream
+# (their own rate limiter), so they never slow the direct-path stores. When this
+# is unset those stores are skipped entirely — no dead-weight 429s.
+# ---------------------------------------------------------------------------
+RESIDENTIAL_PROXY_URL = os.environ.get("RESIDENTIAL_PROXY_URL", "").strip()
+
+
+def shopify_proxies() -> dict | None:
+    """requests-style proxies mapping for proxy=True stores, or None when no
+    RESIDENTIAL_PROXY_URL is configured (callers then skip those stores)."""
+    if not RESIDENTIAL_PROXY_URL:
+        return None
+    return {"http": RESIDENTIAL_PROXY_URL, "https": RESIDENTIAL_PROXY_URL}
+
+
 # Curated TCG retailers exposing a public Shopify /products.json (verified live).
 #   currency : the store's selling currency (from https://<domain>/meta.json).
 #              Only USD stores run the below-market deal test — the market prices
@@ -148,13 +167,24 @@ SHOPIFY_STORES = [
     {"domain": "gamebreakers.ca",          "name": "Game Breakers",           "currency": "CAD", "game": None},
     {"domain": "untouchables.ca",          "name": "Untouchables",            "currency": "CAD", "game": None},
     {"domain": "vortexgames.ca",           "name": "Vortex Games",            "currency": "CAD", "game": None},
-    # Verified to HAVE a live /products.json, but their Cloudflare returns 429 to this
-    # datacenter IP on every request (tested at limit=50 and 250, scanner idle). They
-    # would only add dead weight here — re-add ONLY behind residential proxies:
-    #   USD: cardsmiths.com, collectorstore.com, gamekastle.com, gnomegames.com,
-    #        potomacdistribution.com, thecardvault.com, thegamersden.com, yourplaymat.com
-    #   GBP: goblingaming.co.uk, leisuregames.com
-    #   AUD: guf.com.au, goodgames.com.au, gamesportal.com.au, topdeckgames.com.au
+    # Cloudflare-strict stores — they 429 this datacenter IP on every request, so
+    # each is marked proxy=True: fetched through RESIDENTIAL_PROXY_URL when it is
+    # set (as a separate request stream), and skipped entirely when it is not.
+    # The USD ones run the full below-market deal test; the rest are restock-only.
+    {"domain": "cardsmiths.com",           "name": "Cardsmiths",              "currency": "USD", "game": None, "proxy": True},
+    {"domain": "collectorstore.com",       "name": "Collector Store",         "currency": "USD", "game": None, "proxy": True},
+    {"domain": "gamekastle.com",           "name": "Game Kastle",             "currency": "USD", "game": None, "proxy": True},
+    {"domain": "gnomegames.com",           "name": "Gnome Games",             "currency": "USD", "game": None, "proxy": True},
+    {"domain": "potomacdistribution.com",  "name": "Potomac Distribution",    "currency": "USD", "game": None, "proxy": True},
+    {"domain": "thecardvault.com",         "name": "The Card Vault",          "currency": "USD", "game": None, "proxy": True},
+    {"domain": "thegamersden.com",         "name": "The Gamers Den",          "currency": "USD", "game": None, "proxy": True},
+    {"domain": "yourplaymat.com",          "name": "Your Playmat",            "currency": "USD", "game": None, "proxy": True},
+    {"domain": "goblingaming.co.uk",       "name": "Goblin Gaming",           "currency": "GBP", "game": None, "proxy": True},
+    {"domain": "leisuregames.com",         "name": "Leisure Games",           "currency": "GBP", "game": None, "proxy": True},
+    {"domain": "guf.com.au",               "name": "GUF",                     "currency": "AUD", "game": None, "proxy": True},
+    {"domain": "goodgames.com.au",         "name": "Good Games",              "currency": "AUD", "game": None, "proxy": True},
+    {"domain": "gamesportal.com.au",       "name": "Games Portal",            "currency": "AUD", "game": None, "proxy": True},
+    {"domain": "topdeckgames.com.au",      "name": "Top Deck Games",          "currency": "AUD", "game": None, "proxy": True},
 ]
 
 # ---------------------------------------------------------------------------

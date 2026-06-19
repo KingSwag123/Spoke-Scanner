@@ -62,6 +62,7 @@ from config import (
     MIN_PRICE_FLOOR,
     PREMIUM_THRESHOLD,
     PRICED_GAMES,
+    RESIDENTIAL_PROXY_URL,
     SEALED_SANITY_FLOOR,
     SEEN_EXPIRY_DAYS,
     SEEN_FILE,
@@ -540,7 +541,15 @@ def main() -> None:
     print(f"[START] Premium routing: graded slabs + market >= ${PREMIUM_THRESHOLD:.0f} → #premium (grails)")
     print(f"[START] Price floor: ${MIN_PRICE_FLOOR:.2f} | Deal threshold: total <= market × {DEAL_RATIO}")
     print(f"[START] Dedup: permanent per listing ID | Check interval: {CHECK_INTERVAL // 60} min")
-    print(f"[START] Shopify retail watch: {len(SHOPIFY_STORES)} store(s) — sealed restock + below-market (USD)\n")
+    _proxy_stores  = [s for s in SHOPIFY_STORES if s.get("proxy")]
+    _direct_stores = [s for s in SHOPIFY_STORES if not s.get("proxy")]
+    if RESIDENTIAL_PROXY_URL:
+        print(f"[START] Shopify retail watch: {len(SHOPIFY_STORES)} store(s) "
+              f"({len(_proxy_stores)} via residential proxy) — sealed restock + below-market (USD)\n")
+    else:
+        print(f"[START] Shopify retail watch: {len(_direct_stores)} store(s) active "
+              f"(+{len(_proxy_stores)} proxy-only idle — set RESIDENTIAL_PROXY_URL) — "
+              f"sealed restock + below-market (USD)\n")
 
     seen = load_seen()
     availability = load_availability()
