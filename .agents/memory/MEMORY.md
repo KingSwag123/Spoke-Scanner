@@ -2,3 +2,4 @@
 
 - [TCG Shopify watchlist](shopify-watchlist.md) — which stores are addable, why some 429 forever, verifier gotchas, USD-only deal pipeline.
 - [Residential proxy](residential-proxy.md) — proxy=True stores route via RESIDENTIAL_PROXY_URL on a separate throttle stream, skipped when unset/invalid; metered lane uses shallower pages + slower cadence to fit GB budget; MUST redact creds in logs.
+- [Duplicate sealed pings](duplicate-pings.md) — Shopify lists one box under multiple ids → dedup is item_id-keyed → dup alerts; collapse by (store, normalized title) with a STABLE min-id rep; eBay multi-seller is legit, never collapse it.

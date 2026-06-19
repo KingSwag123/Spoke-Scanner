@@ -300,6 +300,13 @@ def scan_open_market(seen: dict, availability: dict) -> None:
         ):
             commit_available(availability, it)
             restock_alerts += 1
+            # Suppress a same-cycle [SEALED] deal ping for this same box: the
+            # restock alert already fired, so claim its id in cycle_ids so the
+            # deal pass below skips it. Only on a delivered restock — a failed
+            # send leaves the deal pass free to still surface it (no lost
+            # signal, no duplicate). A below-market box that stays in stock will
+            # be picked up by the deal pass on a later cycle (no restock there).
+            cycle_ids.add(it["item_id"])
     save_availability(availability)
 
     # Feed AVAILABLE, USD-priced, SEALED Shopify variants into the same deal

@@ -221,6 +221,46 @@ def fetch_shopify_listings(store: dict) -> list[dict]:
     return listings
 
 
+def _collapse_duplicate_variants(listings: list[dict]) -> list[dict]:
+    """Collapse listings that are the SAME product at the SAME store.
+
+    A few retailers expose one sealed product under multiple variant ids or
+    duplicate catalog entries (identical store + title). Each id is otherwise
+    distinct, so item_id dedup downstream treats them as separate items and they
+    fire DUPLICATE restock/deal alerts for what the user sees as one box.
+
+    Each (store, normalized-title) group collapses to a single representative:
+      • id  — the lowest item_id in the group, so the choice is STABLE across
+        cycles (variant ids never change) and the restock/seen state keyed by it
+        stays put (no spurious re-baseline or re-alert).
+      • available — True if ANY duplicate is in stock (so a real restock fires).
+      • price/url — the cheapest in-stock duplicate (so the best deal is kept and
+        the link points at a buyable variant).
+    Singletons (the overwhelming majority) pass through unchanged. The key
+    includes the store, so the same title at DIFFERENT stores stays separate —
+    those are genuinely distinct deals. eBay listings never reach here, so
+    different sellers' identical titles are unaffected.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for it in listings:
+        key = (it.get("store", ""), " ".join(it["title"].split()).casefold())
+        groups.setdefault(key, []).append(it)
+    out: list[dict] = []
+    for group in groups.values():
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        rep = dict(min(group, key=lambda x: x["item_id"]))
+        in_stock = [g for g in group if g.get("available")]
+        rep["available"] = bool(in_stock)
+        if in_stock:
+            best = min(in_stock, key=lambda x: x["price"])
+            rep["price"] = best["price"]
+            rep["url"]   = best["url"]
+        out.append(rep)
+    return out
+
+
 def fetch_all_shopify_listings(stores: list[dict]) -> list[dict]:
     """Fetch every store's /products.json concurrently; return all variants.
 
@@ -272,7 +312,7 @@ def fetch_all_shopify_listings(stores: list[dict]) -> list[dict]:
             except Exception as e:  # defensive — per-store errors are handled inside
                 name = store.get("name", store.get("domain", "?"))
                 print(f"  [SHOPIFY][ERROR] {name} — gather failed: {_safe_err(e)}")
-    return listings
+    return _collapse_duplicate_variants(listings)
 
 
 # ---------------------------------------------------------------------------
