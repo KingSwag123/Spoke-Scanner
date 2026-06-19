@@ -133,9 +133,11 @@ def proxy_url_is_valid() -> bool:
     if url.split("://", 1)[0].lower() not in _PROXY_SCHEMES:
         return False
     try:
-        return bool(urllib.parse.urlsplit(url).hostname)
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # accessing .port raises ValueError on a non-numeric / out-of-range port
     except ValueError:
         return False
+    return bool(parts.hostname)
 
 
 def shopify_proxies() -> dict | None:
