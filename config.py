@@ -17,6 +17,7 @@ Requirements:
 
 import os
 import re
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Config
@@ -118,10 +119,29 @@ SHOPIFY_GLOBAL_MIN_INTERVAL = 0.5  # min seconds between ANY two Shopify request
 RESIDENTIAL_PROXY_URL = os.environ.get("RESIDENTIAL_PROXY_URL", "").strip()
 
 
+_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4")
+
+
+def proxy_url_is_valid() -> bool:
+    """True only when RESIDENTIAL_PROXY_URL looks like a usable proxy endpoint
+    (scheme://[user:pass@]host[:port]). Guards against a stray value — e.g. a
+    pasted `curl ...` command or a host:port with no scheme — that would
+    otherwise raise InvalidURL on every proxied request."""
+    url = RESIDENTIAL_PROXY_URL
+    if "://" not in url:
+        return False
+    if url.split("://", 1)[0].lower() not in _PROXY_SCHEMES:
+        return False
+    try:
+        return bool(urllib.parse.urlsplit(url).hostname)
+    except ValueError:
+        return False
+
+
 def shopify_proxies() -> dict | None:
     """requests-style proxies mapping for proxy=True stores, or None when no
-    RESIDENTIAL_PROXY_URL is configured (callers then skip those stores)."""
-    if not RESIDENTIAL_PROXY_URL:
+    valid RESIDENTIAL_PROXY_URL is configured (callers then skip those stores)."""
+    if not proxy_url_is_valid():
         return None
     return {"http": RESIDENTIAL_PROXY_URL, "https": RESIDENTIAL_PROXY_URL}
 

@@ -69,6 +69,7 @@ from config import (
     SHOPIFY_STORES,
     SINGLE_SANITY_FLOOR,
     WEBHOOKS,
+    shopify_proxies,
 )
 from api_engines import (
     detect_language,
@@ -543,10 +544,14 @@ def main() -> None:
     print(f"[START] Dedup: permanent per listing ID | Check interval: {CHECK_INTERVAL // 60} min")
     _proxy_stores  = [s for s in SHOPIFY_STORES if s.get("proxy")]
     _direct_stores = [s for s in SHOPIFY_STORES if not s.get("proxy")]
-    if RESIDENTIAL_PROXY_URL:
+    if shopify_proxies() is not None:
         print(f"[START] Shopify retail watch: {len(SHOPIFY_STORES)} store(s) "
               f"({len(_proxy_stores)} via residential proxy) — sealed restock + below-market (USD)\n")
     else:
+        if RESIDENTIAL_PROXY_URL:
+            print(f"[START][WARN] RESIDENTIAL_PROXY_URL is set but is not a valid proxy URL "
+                  f"(expected scheme://user:pass@host:port) — the {len(_proxy_stores)} proxied "
+                  f"store(s) are skipped this run.")
         print(f"[START] Shopify retail watch: {len(_direct_stores)} store(s) active "
               f"(+{len(_proxy_stores)} proxy-only idle — set RESIDENTIAL_PROXY_URL) — "
               f"sealed restock + below-market (USD)\n")

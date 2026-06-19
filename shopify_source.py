@@ -228,14 +228,14 @@ def fetch_all_shopify_listings(stores: list[dict]) -> list[dict]:
     if not stores:
         return []
     # Proxy-only stores are unreachable from the bare datacenter IP. When no
-    # RESIDENTIAL_PROXY_URL is configured, skip them outright rather than burning
-    # a guaranteed-429 request on each one every cycle.
+    # valid RESIDENTIAL_PROXY_URL is configured, skip them outright rather than
+    # burning a guaranteed-429 request on each one every cycle.
     if shopify_proxies() is None:
         proxy_only = [s for s in stores if s.get("proxy")]
         if proxy_only:
             stores = [s for s in stores if not s.get("proxy")]
             print(f"  [SHOPIFY] {len(proxy_only)} proxy-only store(s) skipped — "
-                  f"set RESIDENTIAL_PROXY_URL to enable them")
+                  f"RESIDENTIAL_PROXY_URL not set or invalid")
     if not stores:
         return []
     workers = min(SHOPIFY_MAX_WORKERS, len(stores))
