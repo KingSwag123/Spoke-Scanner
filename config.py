@@ -108,6 +108,13 @@ SHOPIFY_GLOBAL_MIN_INTERVAL = 0.5  # min seconds between ANY two Shopify request
                                    # ~250 req/cycle (~50 stores × 5 pages) is the practical ceiling
                                    # within the 5-min window.
 
+# Proxy lane is metered (residential proxies bill by GB), so proxy=True stores
+# are swept on a slower cadence and at shallower depth than the free direct
+# stores. ~2 pages every 30 min × 14 stores ≈ 3.4 GB/mo (gzipped ~85 KB/page) —
+# fits a 5 GB plan with headroom. Direct stores keep SHOPIFY_MAX_PAGES/cycle.
+SHOPIFY_PROXY_MAX_PAGES     = 2     # /products.json pages per PROXY store (direct uses SHOPIFY_MAX_PAGES)
+SHOPIFY_PROXY_SCAN_INTERVAL = 1800  # min seconds between proxy-store sweeps (30 min)
+
 # ---------------------------------------------------------------------------
 # Residential proxy (optional) — unlocks the Cloudflare-strict stores that 429
 # this datacenter IP on every request. Set RESIDENTIAL_PROXY_URL to a rotating

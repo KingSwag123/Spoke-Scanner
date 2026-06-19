@@ -66,6 +66,8 @@ from config import (
     SEALED_SANITY_FLOOR,
     SEEN_EXPIRY_DAYS,
     SEEN_FILE,
+    SHOPIFY_PROXY_MAX_PAGES,
+    SHOPIFY_PROXY_SCAN_INTERVAL,
     SHOPIFY_STORES,
     SINGLE_SANITY_FLOOR,
     WEBHOOKS,
@@ -546,7 +548,8 @@ def main() -> None:
     _direct_stores = [s for s in SHOPIFY_STORES if not s.get("proxy")]
     if shopify_proxies() is not None:
         print(f"[START] Shopify retail watch: {len(SHOPIFY_STORES)} store(s) "
-              f"({len(_proxy_stores)} via residential proxy) — sealed restock + below-market (USD)\n")
+              f"({len(_proxy_stores)} via residential proxy: {SHOPIFY_PROXY_MAX_PAGES} pages every "
+              f"{SHOPIFY_PROXY_SCAN_INTERVAL // 60} min, bandwidth-saver) — sealed restock + below-market (USD)\n")
     else:
         if RESIDENTIAL_PROXY_URL:
             print(f"[START][WARN] RESIDENTIAL_PROXY_URL is set but is not a valid proxy URL "

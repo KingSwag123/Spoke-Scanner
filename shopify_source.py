@@ -50,6 +50,8 @@ from config import (
     SHOPIFY_MAX_PAGES,
     SHOPIFY_MAX_WORKERS,
     SHOPIFY_PAGE_LIMIT,
+    SHOPIFY_PROXY_MAX_PAGES,
+    SHOPIFY_PROXY_SCAN_INTERVAL,
     SHOPIFY_REQUEST_INTERVAL,
     SHOPIFY_STATE_EXPIRY_DAYS,
     SHOPIFY_TIMEOUT,
@@ -121,6 +123,10 @@ def _safe_err(e: Exception) -> str:
 _DIRECT_STREAM = {"lock": threading.Lock(), "last": 0.0}
 _PROXY_STREAM  = {"lock": threading.Lock(), "last": 0.0}
 
+# Wall-clock gate for the metered proxy lane: proxy stores are swept at most once
+# per SHOPIFY_PROXY_SCAN_INTERVAL. None = never swept yet → due on the first cycle.
+_last_proxy_scan: float | None = None
+
 
 def _throttle(stream: dict) -> None:
     """Block until SHOPIFY_GLOBAL_MIN_INTERVAL has elapsed since the last request
@@ -148,8 +154,9 @@ def fetch_shopify_listings(store: dict) -> list[dict]:
     proxies  = shopify_proxies() if proxied else None
     stream   = _PROXY_STREAM if proxied else _DIRECT_STREAM
 
+    max_pages = SHOPIFY_PROXY_MAX_PAGES if proxied else SHOPIFY_MAX_PAGES
     listings: list[dict] = []
-    for page in range(1, SHOPIFY_MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         try:
             _throttle(stream)
             resp = requests.get(
@@ -236,6 +243,22 @@ def fetch_all_shopify_listings(stores: list[dict]) -> list[dict]:
             stores = [s for s in stores if not s.get("proxy")]
             print(f"  [SHOPIFY] {len(proxy_only)} proxy-only store(s) skipped — "
                   f"RESIDENTIAL_PROXY_URL not set or invalid")
+    # The proxy lane bills metered residential bandwidth, so sweep proxy stores
+    # far less often than the free direct stores. Between sweeps only direct
+    # stores are fetched; deferred stores keep their last availability snapshot
+    # (detect_restocks only touches variants present this cycle), so nothing is
+    # falsely marked sold-out.
+    global _last_proxy_scan
+    proxy_due = [s for s in stores if s.get("proxy")]
+    if proxy_due:
+        now = time.monotonic()
+        if _last_proxy_scan is None or (now - _last_proxy_scan) >= SHOPIFY_PROXY_SCAN_INTERVAL:
+            _last_proxy_scan = now
+        else:
+            stores = [s for s in stores if not s.get("proxy")]
+            mins_left = int((SHOPIFY_PROXY_SCAN_INTERVAL - (now - _last_proxy_scan)) / 60)
+            print(f"  [SHOPIFY] {len(proxy_due)} proxy store(s) deferred "
+                  f"(bandwidth saver) — next proxy sweep in ~{mins_left} min")
     if not stores:
         return []
     workers = min(SHOPIFY_MAX_WORKERS, len(stores))
