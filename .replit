@@ -32,3 +32,4 @@ outputType = "console"
 [deployment]
 deploymentTarget = "vm"
 run = ["python", "main.py"]
+ignorePorts = true
