@@ -13,6 +13,7 @@ import requests
 from config import (
     _CHANNEL_COLORS,
     GAME_DISPLAY,
+    POST_TO_DISCORD,
     PREMIUM_THRESHOLD,
     WEBHOOK_PLACEHOLDER,
     WEBHOOKS,
@@ -59,7 +60,16 @@ def determine_channel(
 # ---------------------------------------------------------------------------
 
 def _post_embed(webhook_url: str, embed: dict, channel: str, game_name: str) -> bool:
-    """POST a single embed; return True only on confirmed 2xx delivery."""
+    """POST a single embed; return True only on confirmed 2xx delivery.
+
+    In the workspace this runs in DRY-RUN (POST_TO_DISCORD is False): nothing is
+    sent, but we return True so the caller still advances its dedup/seen state
+    exactly as production would — keeping the dev log clean across cycles and
+    ensuring only ONE running instance (the Deployment) actually posts."""
+    if not POST_TO_DISCORD:
+        print(f"  [DRY-RUN] would send → #{game_name}/{channel} "
+              f"(workspace copy; set DISCORD_LIVE=1 to post for real)")
+        return True
     try:
         resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
         resp.raise_for_status()

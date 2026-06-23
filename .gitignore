@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Workspace (dry-run) runtime state — kept separate from the committed
+# production seed so dev's simulated "seen" items never seed the Deployment.
+*.local.json

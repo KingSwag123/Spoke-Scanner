@@ -20,9 +20,22 @@ import re
 import urllib.parse
 
 # ---------------------------------------------------------------------------
+# Live-posting / dry-run discriminator (see POST_TO_DISCORD below for the full
+# rationale). Defined up here because the runtime STATE FILE paths depend on it:
+# the workspace (dry-run) must keep its dedup/restock state in SEPARATE, git-
+# ignored *.local.json files so its simulated "seen" items never get committed
+# and seed the Deployment — which would make production silently skip real pings.
+# ---------------------------------------------------------------------------
+_DISCORD_LIVE = (
+    os.environ.get("REPLIT_DEPLOYMENT") == "1"
+    or os.environ.get("DISCORD_LIVE", "").strip().lower() in ("1", "true", "yes")
+)
+_STATE_SUFFIX = "" if _DISCORD_LIVE else ".local"
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SEEN_FILE        = "seen_listings.json"   # persists permanent dedup state across restarts
+SEEN_FILE        = f"seen_listings{_STATE_SUFFIX}.json"   # permanent dedup state; .local in dry-run
 
 CHECK_INTERVAL   = 300     # seconds between scan cycles (5 min)
 SEEN_EXPIRY_DAYS = 90      # drop seen entries older than this (anti-bloat)
@@ -85,7 +98,7 @@ PRICED_GAMES = {"pokemon", "mtg", "lorcana", "onepiece"}
 # Shopify retail source (see shopify_source.py) — a second product source that
 # scans curated TCG retailers' public /products.json for restock + deal signals.
 # ---------------------------------------------------------------------------
-SHOPIFY_AVAILABILITY_FILE = "shopify_availability.json"  # restock state across cycles
+SHOPIFY_AVAILABILITY_FILE = f"shopify_availability{_STATE_SUFFIX}.json"  # restock state; .local in dry-run
 SHOPIFY_MAX_PAGES         = 5      # /products.json pages scanned per store (250 products each)
 SHOPIFY_PAGE_LIMIT        = 250    # products per page (Shopify hard max)
 SHOPIFY_REQUEST_INTERVAL  = 0.5    # polite delay (seconds) between Shopify HTTP requests
@@ -239,6 +252,19 @@ WEBHOOKS = {
     game: {tier: _slot(game, tier) for tier in ("premium", "budget", "sealed")}
     for game in ("pokemon", "mtg", "lorcana", "onepiece")
 }
+
+# ---------------------------------------------------------------------------
+# Live-posting guard — the fix for duplicate Discord pings from two instances.
+#
+# The dev workspace and the published Deployment run the SAME loop against the
+# SAME webhook secrets but keep SEPARATE dedup state, so when both run every
+# alert fires twice. Discord posting is therefore LIVE only inside a Deployment:
+# Replit sets REPLIT_DEPLOYMENT="1" there and nowhere else, so the workspace copy
+# runs in DRY-RUN (logs what it WOULD post, sends nothing). Set DISCORD_LIVE=1 to
+# force real delivery from the workspace when you explicitly want to test posting.
+# (Decided once as _DISCORD_LIVE at the top of this file; reused here.)
+# ---------------------------------------------------------------------------
+POST_TO_DISCORD = _DISCORD_LIVE
 
 EBAY_APP_ID  = os.environ.get("EBAY_APP_ID", "")
 EBAY_CERT_ID = os.environ.get("EBAY_CERT_ID", "")

@@ -60,6 +60,7 @@ from config import (
     GAME_DISPLAY,
     GAME_STREAMS,
     MIN_PRICE_FLOOR,
+    POST_TO_DISCORD,
     PREMIUM_THRESHOLD,
     PRICED_GAMES,
     RESIDENTIAL_PROXY_URL,
@@ -551,6 +552,11 @@ def main() -> None:
     print(f"[START] Premium routing: graded slabs + market >= ${PREMIUM_THRESHOLD:.0f} → #premium (grails)")
     print(f"[START] Price floor: ${MIN_PRICE_FLOOR:.2f} | Deal threshold: total <= market × {DEAL_RATIO}")
     print(f"[START] Dedup: permanent per listing ID | Check interval: {CHECK_INTERVAL // 60} min")
+    if POST_TO_DISCORD:
+        print(f"[START] Discord posting: LIVE — this instance delivers alerts")
+    else:
+        print(f"[START] Discord posting: DRY-RUN — workspace copy, sends nothing "
+              f"(only the Deployment posts; set DISCORD_LIVE=1 to override)")
     _proxy_stores  = [s for s in SHOPIFY_STORES if s.get("proxy")]
     _direct_stores = [s for s in SHOPIFY_STORES if not s.get("proxy")]
     if shopify_proxies() is not None:
