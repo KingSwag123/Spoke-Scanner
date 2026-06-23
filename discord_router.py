@@ -198,12 +198,14 @@ def send_restock_alert(
     store_name: str,
     language: str = "Unknown",
     image_url: str = "",
+    channel: str = "restock",
 ) -> bool:
     """Sealed-product restock alert — fires when an out-of-stock retail item
     comes back in stock at a Shopify store. Unlike the deal alerts this shows the
     retail price in the store's own currency and makes NO market/discount claim
     (retail restocks aren't necessarily below market — the value is availability).
-    Routes to the game's #sealed channel."""
+    Routes to the dedicated #restock channel when configured, else the game's
+    #sealed channel (caller passes the resolved `channel`)."""
     color = _CHANNEL_COLORS.get("restock", 0x1ABC9C)
     game  = GAME_DISPLAY.get(game_name, game_name.title())
 
@@ -221,10 +223,10 @@ def send_restock_alert(
         "url":         url,
         "color":       color,
         "fields":      meta_row,
-        "footer":      {"text": f"#{game_name}/sealed  •  Retail Restock Watch"},
+        "footer":      {"text": f"#{game_name}/{channel}  •  Retail Restock Watch"},
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
     if image_url:
         embed["thumbnail"] = {"url": image_url}
 
-    return _post_embed(webhook_url, embed, "sealed", game_name)
+    return _post_embed(webhook_url, embed, channel, game_name)

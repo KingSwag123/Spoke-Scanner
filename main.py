@@ -64,6 +64,7 @@ from config import (
     PREMIUM_THRESHOLD,
     PRICED_GAMES,
     RESIDENTIAL_PROXY_URL,
+    RESTOCK_WEBHOOK,
     SEALED_SANITY_FLOOR,
     SEEN_EXPIRY_DAYS,
     SEEN_FILE,
@@ -289,7 +290,12 @@ def scan_open_market(seen: dict, availability: dict) -> None:
     restock_alerts = 0
     for it in detect_restocks(shopify_all, availability):
         game = it["game_name"]
-        rchannel, rwebhook = determine_channel(game, it["title"], sealed=True)
+        # Dedicated restock channel when configured (one channel for all games);
+        # otherwise fall back to the game's #sealed channel (legacy behavior).
+        if webhook_is_set(RESTOCK_WEBHOOK):
+            rchannel, rwebhook = "restock", RESTOCK_WEBHOOK
+        else:
+            rchannel, rwebhook = determine_channel(game, it["title"], sealed=True)
         if not webhook_is_set(rwebhook):
             continue
         print(f"  [RESTOCK] {it['store']} {it['price']:.2f} {it['currency']} "
@@ -297,7 +303,7 @@ def scan_open_market(seen: dict, availability: dict) -> None:
         if send_restock_alert(
             it["title"], it["url"], it["price"], it["currency"],
             rwebhook, game, it["store"],
-            language=it["language"], image_url=it["image_url"],
+            language=it["language"], image_url=it["image_url"], channel=rchannel,
         ):
             commit_available(availability, it)
             restock_alerts += 1

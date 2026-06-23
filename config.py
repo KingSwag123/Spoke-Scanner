@@ -253,6 +253,12 @@ WEBHOOKS = {
     for game in ("pokemon", "mtg", "lorcana", "onepiece")
 }
 
+# Dedicated restock channel — a SINGLE webhook that receives every game's retail
+# restock alert. When set, restock pings go here instead of each game's #sealed
+# channel; when unset they fall back to #sealed (legacy behavior), so this is
+# safe to leave blank.
+RESTOCK_WEBHOOK = os.environ.get("RESTOCK_WEBHOOK", "")
+
 # ---------------------------------------------------------------------------
 # Live-posting guard — the fix for duplicate Discord pings from two instances.
 #
