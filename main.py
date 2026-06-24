@@ -549,6 +549,10 @@ def main() -> None:
             states.append(f"{tier}={'SET' if ok else 'empty'}")
         print(f"[START]   {game_name:9s} {' | '.join(states)}")
     print(f"[START] {filled}/12 webhook slots filled")
+    if webhook_is_set(RESTOCK_WEBHOOK):
+        print(f"[START] Restock channel: SET → all games' retail restocks post to #restock")
+    else:
+        print(f"[START] Restock channel: unset → restocks fall back to each game's #sealed")
     if filled == 0:
         print("[WARN] No webhook slots are filled — nothing will be sent until you "
               "add at least one GAME_TIER_WEBHOOK (or DISCORD_WEBHOOK_URL) secret.")
