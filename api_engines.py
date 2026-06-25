@@ -62,12 +62,45 @@ from config import (
 
 # pokemontcg.io anonymous access is rate-limited — space out live calls.
 _last_api_ts      = 0.0
-_price_cache: dict = {}    # (species, num, total) -> (market_price, matched_name) | None  (cleared each cycle)
+
+# Market-price cache PERSISTED ACROSS CYCLES with a TTL. Clearing it every cycle
+# (the old behavior) forced a re-lookup of hundreds of the same cards every 5 min,
+# hammering the rate-limited free price APIs → repeated 429s + 60s back-offs that
+# stalled the deal pass and delayed pings by up to an hour. Prices barely move
+# minute-to-minute, so we keep them and only re-price newly-seen cards.
+#   key -> (value, monotonic_expiry)   value = (market_price, matched_name) | None
+_price_cache: dict  = {}
+_CACHE_MISS         = object()   # "not cached" — distinct from a cached None (genuine no-match)
+_PRICE_CACHE_TTL    = 1800.0     # successful price: 30 min
+_NEG_CACHE_TTL      = 600.0      # genuine no-match (None): 10 min — retry sooner in case it later prices
+
+
+def _cache_get(key):
+    """Return the cached value, or _CACHE_MISS if absent/expired (evicting it)."""
+    entry = _price_cache.get(key)
+    if entry is None:
+        return _CACHE_MISS
+    value, expiry = entry
+    if time.monotonic() >= expiry:
+        _price_cache.pop(key, None)
+        return _CACHE_MISS
+    return value
+
+
+def _cache_put(key, value):
+    """Cache a result with a TTL (shorter for a genuine no-match). Returns value."""
+    ttl = _PRICE_CACHE_TTL if value is not None else _NEG_CACHE_TTL
+    _price_cache[key] = (value, time.monotonic() + ttl)
+    return value
 
 
 def reset_cycle_cache() -> None:
-    """Clear the in-cycle TCG price cache (called once per scan cycle)."""
-    _price_cache.clear()
+    """Evict only EXPIRED price entries (called once per scan cycle). Prices now
+    persist across cycles via their TTL instead of being wiped every cycle, so we
+    stop re-pricing the same cards every 5 min and starving the rate-limited APIs."""
+    now = time.monotonic()
+    for k in [k for k, (_, expiry) in _price_cache.items() if now >= expiry]:
+        _price_cache.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +281,9 @@ def fetch_market_price(species: str, number: str, set_total: str):
         (conservative — avoids over-stating value and firing false deals).
     """
     key = (species, number, set_total)
-    if key in _price_cache:
-        return _price_cache[key]
+    cached = _cache_get(key)
+    if cached is not _CACHE_MISS:
+        return cached
 
     _rate_limit()
     try:
@@ -266,14 +300,12 @@ def fetch_market_price(species: str, number: str, set_total: str):
         cards = resp.json().get("data", [])
     except requests.RequestException as e:
         print(f"  [WARN] pokemontcg.io request failed for '{species} {number}': {e}")
-        _price_cache[key] = None
-        return None
+        return None     # transient — do NOT cache, retry next cycle
 
     want_num = _digits(number)
     candidates = [c for c in cards if _digits(c.get("number", "")) == want_num]
     if not candidates:
-        _price_cache[key] = None
-        return None
+        return _cache_put(key, None)
 
     # Prefer exact set-total (denominator) matches; fall back to all number matches.
     exact = [c for c in candidates if c.get("set", {}).get("printedTotal") == int(set_total)]
@@ -281,8 +313,7 @@ def fetch_market_price(species: str, number: str, set_total: str):
 
     distinct_ids = {c.get("id") for c in pool}
     if len(distinct_ids) > 1:
-        _price_cache[key] = None     # ambiguous — skip for precision
-        return None
+        return _cache_put(key, None)     # ambiguous — skip for precision
 
     card    = pool[0]
     markets = [
@@ -291,12 +322,10 @@ def fetch_market_price(species: str, number: str, set_total: str):
         if v.get("market")
     ]
     if not markets:
-        _price_cache[key] = None
-        return None
+        return _cache_put(key, None)
 
     result = (min(markets), card.get("name", species.title()))
-    _price_cache[key] = result
-    return result
+    return _cache_put(key, result)
 
 
 # ---------------------------------------------------------------------------
@@ -310,10 +339,12 @@ _last_fast_ts      = 0.0
 _fast_cooldown_until = 0.0     # monotonic deadline: after a 429 we pause ALL fast calls
 _FAST_COOLDOWN_MAX_WAIT = 65.0 # block long enough to wait out Scryfall's Retry-After: 60 window
 
-# Sentinel returned by the fast fetchers on a transient rate-limit (429 / cooldown).
-# Distinct from None (a genuine no-match) so the caller can skip WITHOUT caching it —
-# caching a transient failure would permanently mark a real card as unpriceable.
-_RATELIMITED = object()
+# Sentinels returned by the fast fetchers instead of None when a failure is
+# TRANSIENT. Distinct from None (a genuine no-match) so the caller skips WITHOUT
+# caching it — caching a transient failure would wrongly mark a real card as
+# unpriceable for the whole TTL window.
+_RATELIMITED = object()   # 429 / active cooldown — also pauses the whole fast path
+_TRANSIENT   = object()   # network error / 5xx / unparseable body — retry next cycle
 
 
 def _fast_throttle() -> None:
@@ -399,15 +430,15 @@ def _progressive_price(tokens: list[str], fetch_one, cache_prefix: str):
     for k in range(len(tokens), 0, -1):
         name = " ".join(tokens[:k])
         key  = (cache_prefix, name)
-        if key in _price_cache:
-            res = _price_cache[key]
-        else:
+        res  = _cache_get(key)
+        if res is _CACHE_MISS:
             res = fetch_one(name)
-            # A transient rate-limit must NOT be cached (it would permanently
-            # poison a real card) and means every further prefix is also limited.
-            if res is _RATELIMITED:
+            # A transient failure (rate-limit / network / 5xx / bad JSON) must NOT
+            # be cached (it would poison a real card for the TTL) and means every
+            # further prefix is also unreachable — abort and retry next cycle.
+            if res is _RATELIMITED or res is _TRANSIENT:
                 return None
-            _price_cache[key] = res
+            _cache_put(key, res)
         if res:
             return res
     return None
@@ -424,19 +455,21 @@ def _scryfall_one(name: str, foil: bool):
         )
     except requests.RequestException as e:
         print(f"  [WARN] Scryfall request failed for '{name}': {e}")
-        return None
+        return _TRANSIENT               # network blip — retry next cycle, don't cache
     if r.status_code in (429, 403):
         # 429 = rate-limited; 403 = anti-abuse block. Both are transient and must
         # NOT be cached as a real no-match — back off and retry next cycle so one
         # blocked call doesn't poison every later MTG card in the cycle.
         _trip_fast_cooldown(r)
         return _RATELIMITED
-    if r.status_code != 200:            # 404 = no/ambiguous fuzzy match
+    if r.status_code >= 500:            # server error — transient, don't cache
+        return _TRANSIENT
+    if r.status_code != 200:            # 404 = no/ambiguous fuzzy match (genuine)
         return None
     try:
         d = r.json()
     except ValueError:
-        return None
+        return _TRANSIENT               # unparseable body — transient, don't cache
     prices = d.get("prices", {}) or {}
     raw = (prices.get("usd_foil") if foil else None) or prices.get("usd") or prices.get("usd_foil")
     try:
@@ -461,18 +494,20 @@ def _lorcast_one(name: str, foil: bool):
         )
     except requests.RequestException as e:
         print(f"  [WARN] Lorcast request failed for '{name}': {e}")
-        return None
+        return _TRANSIENT               # network blip — retry next cycle, don't cache
     if r.status_code in (429, 403):
         # 429 = rate-limited; 403 = anti-abuse block. Both transient — back off and
         # retry next cycle instead of caching a false no-match.
         _trip_fast_cooldown(r)
         return _RATELIMITED
+    if r.status_code >= 500:            # server error — transient, don't cache
+        return _TRANSIENT
     if r.status_code != 200:
         return None
     try:
         results = r.json().get("results", []) or []
     except ValueError:
-        return None
+        return _TRANSIENT               # unparseable body — transient, don't cache
     if not results:
         return None
     c = results[0]

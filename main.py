@@ -261,7 +261,8 @@ def fetch_ebay_listings(keywords: str, limit: int = EBAY_STREAM_LIMIT) -> list[d
 # ---------------------------------------------------------------------------
 
 def scan_open_market(seen: dict, availability: dict) -> None:
-    reset_cycle_cache()   # in-cycle TCG cache: dedupe identical lookups per cycle
+    reset_cycle_cache()   # evict expired price-cache entries (prices persist across cycles via TTL)
+    t_start = time.monotonic()
 
     # 1) Gather listings across every game's streams, de-duped by item_id this
     #    cycle. Each listing carries its game_name through the pipeline.
@@ -279,6 +280,7 @@ def scan_open_market(seen: dict, availability: dict) -> None:
                 listings.append(it)
                 fresh += 1
             print(f"[STREAM] {game_name}/'{query}' → {len(results)} listings ({fresh} new this cycle)")
+    t_ebay = time.monotonic()
 
     # 1b) Shopify retail sources — restock alerts (sealed) + below-market deals.
     #     Fetch every store's full variant feed once: restock detection needs to
@@ -337,6 +339,7 @@ def scan_open_market(seen: dict, availability: dict) -> None:
         shopify_deal += 1
     print(f"[SHOPIFY] {len(shopify_all)} variants | {restock_alerts} restock alert(s) | "
           f"{shopify_deal} available USD sealed variant(s) → deal pipeline")
+    t_shopify = time.monotonic()
 
     print(f"[SCAN] {len(listings)} unique listings to evaluate")
 
@@ -515,6 +518,9 @@ def scan_open_market(seen: dict, availability: dict) -> None:
         f"sanity {drop['sanity']} | noslot {drop['noslot']} | error {drop['error']} | "
         f"RESTOCK {restock_alerts} | SEALED {sealed_alerts} | DEALS {deals}"
     )
+    t_deal = time.monotonic()
+    print(f"[TIMING] eBay {t_ebay - t_start:.0f}s | Shopify {t_shopify - t_ebay:.0f}s | "
+          f"deal pass {t_deal - t_shopify:.0f}s | total {t_deal - t_start:.0f}s")
     print(f"[SCAN] cycle complete — {deals} deal(s), {sealed_alerts} sealed alert(s), "
           f"{restock_alerts} restock alert(s)")
     save_seen(seen)
