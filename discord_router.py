@@ -147,8 +147,14 @@ def send_sealed_alert(
     language: str = "Unknown",
     image_url: str = "",
     matched_name: str | None = None,
+    en_title: str | None = None,
 ) -> bool:
-    """Sealed-product deal alert — same market/discount layout as singles."""
+    """Sealed-product deal alert — same market/discount layout as singles.
+
+    en_title: English translation/mapping of a Japanese listing title. When
+    given, it becomes the headline link and the original JP title is shown
+    beneath it in italics.
+    """
     total    = listing_price + shipping
     diff     = market_price - total
     pct      = (diff / market_price * 100) if market_price else 0.0
@@ -175,7 +181,8 @@ def send_sealed_alert(
 
     embed = {
         "title":       f"📦  {game} Deal — Sealed Product",
-        "description": f"### [{title}]({url})",
+        "description": (f"### [{en_title}]({url})\n*🇯🇵 {title}*"
+                        if en_title else f"### [{title}]({url})"),
         "url":         url,
         "color":       color,
         "fields":      price_row + [divider] + meta_row,

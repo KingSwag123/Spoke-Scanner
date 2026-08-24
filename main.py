@@ -468,6 +468,10 @@ def scan_open_market(seen: dict, availability: dict) -> None:
                     language=item["language"],
                     image_url=item["image_url"],
                     matched_name=matched_name,
+                    # JP-market listings: headline the English product name,
+                    # show the original Japanese title beneath it.
+                    en_title=((matched_name or item.get("en_title"))
+                              if item.get("source") in JP_MARKET_SOURCES else None),
                 )
                 if sent:
                     mark_seen(item_id, seen)
