@@ -171,6 +171,31 @@ MERCARI_US_ASSUMED_SHIPPING = 8.00   # search data hides the buyer's shipping co
                                      # conservative (never understate the total)
 
 # ---------------------------------------------------------------------------
+# Yahoo! Auctions Japan — fixed-price (Buy-It-Now) sealed JP boxes only.
+# Reuses the Mercari JP set matcher + FX cache; free-shipping listings only
+# (shipping is unknowable from search results — fail closed).
+# ---------------------------------------------------------------------------
+YAHOO_JP_QUERIES = [
+    ("pokemon", "ポケモンカード BOX シュリンク"),
+    ("pokemon", "ポケモンカード BOX 未開封"),
+]
+YAHOO_JP_SCAN_INTERVAL    = 900      # min seconds between Yahoo sweeps (politeness)
+YAHOO_JP_REQUEST_INTERVAL = 2.0      # spacing between query page fetches (s)
+
+# ---------------------------------------------------------------------------
+# TCGplayer marketplace — sealed products whose lowest live listing undercuts
+# the market price (public mp-search API, no key). (game, productLineName).
+# ---------------------------------------------------------------------------
+TCGPLAYER_PRODUCT_LINES = [
+    ("pokemon",  "pokemon"),
+    ("mtg",      "magic"),
+    ("lorcana",  "disney lorcana"),
+    ("onepiece", "one piece card game"),
+]
+TCGPLAYER_PAGES_PER_GAME = 3         # × 50 newest sealed products per game
+TCGPLAYER_SCAN_INTERVAL  = 1800      # min seconds between sweeps
+
+# ---------------------------------------------------------------------------
 # Residential proxy (optional) — unlocks the Cloudflare-strict stores that 429
 # this datacenter IP on every request. Set RESIDENTIAL_PROXY_URL to a rotating
 # residential proxy endpoint, e.g. "http://user:pass@gateway.provider.com:7000".

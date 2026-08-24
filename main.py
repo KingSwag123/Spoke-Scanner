@@ -67,6 +67,11 @@ from config import (
     MERCARI_JP_QUERIES,
     MERCARI_US_QUERIES,
     MERCARI_US_SCAN_INTERVAL,
+    TCGPLAYER_PAGES_PER_GAME,
+    TCGPLAYER_PRODUCT_LINES,
+    TCGPLAYER_SCAN_INTERVAL,
+    YAHOO_JP_QUERIES,
+    YAHOO_JP_SCAN_INTERVAL,
     RESTOCK_WEBHOOK,
     SCRAPFLY_API_KEY,
     SEALED_SANITY_FLOOR,
@@ -98,6 +103,13 @@ from discord_router import (
     send_sealed_alert,
     webhook_is_set,
 )
+# Sources whose titles are Japanese BY DESIGN (priced against tcgcsv cat 85
+# via a pre-mapped English phrase): bypass the English language filter and the
+# English sealed catalog.
+JP_MARKET_SOURCES = {"mercari_jp", "yahoo_jp"}
+
+from tcgplayer_source import fetch_tcgplayer_listings
+from yahoo_source import fetch_yahoo_jp_listings
 from mercari_source import (
     fetch_mercari_jp_listings,
     fetch_mercari_us_listings,
@@ -353,7 +365,9 @@ def scan_open_market(seen: dict, availability: dict) -> None:
     #     to the common listing shape; per-listing errors are already handled
     #     inside each fetcher, and the whole lane must never abort the cycle.
     for fetcher, label in ((fetch_mercari_jp_listings, "Mercari JP"),
-                           (fetch_mercari_us_listings, "Mercari US")):
+                           (fetch_mercari_us_listings, "Mercari US"),
+                           (fetch_yahoo_jp_listings, "Yahoo JP"),
+                           (fetch_tcgplayer_listings, "TCGplayer")):
         try:
             for it in fetcher():
                 if it["item_id"] in cycle_ids:
@@ -392,7 +406,7 @@ def scan_open_market(seen: dict, availability: dict) -> None:
             # Language filter: keyword-based, tuned for English titles. The JP
             # lane is Japanese BY DESIGN (priced against the Japanese market),
             # so it bypasses this check.
-            if item.get("source") != "mercari_jp" and not is_allowed_language(title):
+            if item.get("source") not in JP_MARKET_SOURCES and not is_allowed_language(title):
                 drop["language"] += 1
                 continue
             # Seller-trust is an eBay-only signal (feedback score/%). Curated
@@ -412,7 +426,7 @@ def scan_open_market(seen: dict, availability: dict) -> None:
                 if is_seen(item_id, seen):
                     drop["seen"] += 1
                     continue
-                if item.get("source") == "mercari_jp":
+                if item.get("source") in JP_MARKET_SOURCES:
                     match = fetch_sealed_price("pokemon_jp", item.get("en_title") or title)
                 else:
                     match = fetch_sealed_price(game, title)
@@ -421,6 +435,14 @@ def scan_open_market(seen: dict, availability: dict) -> None:
                     print(f"  [NOMATCH] ${price:.2f} {game} sealed — {title[:48]}")
                     continue
                 market_price, matched_name = match
+                # TCGplayer items carry the API's own market price for the exact
+                # productId; if the title-token match landed on a different SKU
+                # the two market figures diverge — drop rather than misprice.
+                src_market = item.get("source_market")
+                if src_market and not (0.7 <= market_price / src_market <= 1.3):
+                    drop["nomatch"] += 1
+                    print(f"  [SKUMISMATCH] tcgcsv ${market_price:.2f} vs API ${src_market:.2f} — {title[:44]}")
+                    continue
                 total = price + shipping
                 if total > market_price * DEAL_RATIO:
                     drop["nodeal"] += 1
@@ -613,6 +635,10 @@ def main() -> None:
               f"every {MERCARI_US_SCAN_INTERVAL // 60} min")
     else:
         print(f"[START] Mercari US: idle — set SCRAPFLY_API_KEY to enable the Cloudflare-solving lane")
+    print(f"[START] Yahoo JP: {len(YAHOO_JP_QUERIES)} fixed-price quer(ies) every "
+          f"{YAHOO_JP_SCAN_INTERVAL // 60} min (free-shipping sealed JP boxes only)")
+    print(f"[START] TCGplayer: {len(TCGPLAYER_PRODUCT_LINES)} product line(s), "
+          f"{TCGPLAYER_PAGES_PER_GAME * 50} newest sealed each, every {TCGPLAYER_SCAN_INTERVAL // 60} min")
     _proxy_stores  = [s for s in SHOPIFY_STORES if s.get("proxy")]
     _direct_stores = [s for s in SHOPIFY_STORES if not s.get("proxy")]
     if shopify_proxies() is not None:
