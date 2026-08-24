@@ -14,3 +14,7 @@ description: How the Mercari JP and US lanes work, what's blocked, and the pokem
 - FX (JPY→USD) via open.er-api.com, cached 6h, stale-kept on failure; if no rate has EVER been fetched the JP lane skips the cycle (never misprices).
 - US lane adds an assumed $8 shipping since search data hides buyer shipping cost — deal test stays conservative.
 - Never log Scrapfly error bodies (they can echo the keyed query string) — status code only.
+
+## US lane parsing (Scrapfly)
+- Scrapfly (asp + render_js) does get past CF — 200, real page, ~400KB.
+- mercari.com's __NEXT_DATA__ script tag carries extra attributes (crossorigin) — match with [^>]*, and the blob contains NO item data (results fetched client-side). Parse the rendered DOM cards instead: data-productid="m…", img alt = title (HTML-escaped, unescape; suffixed " - <brand>"), $X.XX price in dollars, srcset first URL for image. JSON walker kept as primary in case they revert.

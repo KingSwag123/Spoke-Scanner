@@ -30,6 +30,7 @@ image_url/store/game_name), plus:
 """
 
 import base64
+import html as _html
 import json
 import re
 import time
@@ -322,34 +323,72 @@ def _parse_us_search(html: str) -> list[dict]:
 
     The exact JSON path shifts with frontend releases, so walk the whole blob
     for objects that look like search items (id starting with 'm' + name +
-    price). Defensive by design; returns [] when the shape is unrecognized.
+    price). If the blob carries no items (the current frontend fetches results
+    client-side), fall back to parsing the rendered product cards in the DOM.
+    Defensive by design; returns [] when neither shape is recognized.
     """
     m = re.search(
-        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
         html, re.DOTALL,
     )
-    if not m:
-        return []
-    try:
-        blob = json.loads(m.group(1))
-    except ValueError:
-        return []
     found: dict[str, dict] = {}
+    if m:
+        try:
+            blob = json.loads(m.group(1))
+        except ValueError:
+            blob = None
+        if blob is not None:
+            def walk(node):
+                if isinstance(node, dict):
+                    iid = node.get("id")
+                    if (isinstance(iid, str) and re.fullmatch(r"m\d{8,}", iid)
+                            and node.get("name") and node.get("price") is not None):
+                        found.setdefault(iid, node)
+                    for v in node.values():
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+            walk(blob)
+    if found:
+        return list(found.values())
+    return _parse_us_search_dom(html)
 
-    def walk(node):
-        if isinstance(node, dict):
-            iid = node.get("id")
-            if (isinstance(iid, str) and re.fullmatch(r"m\d{8,}", iid)
-                    and node.get("name") and node.get("price") is not None):
-                found.setdefault(iid, node)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
 
-    walk(blob)
-    return list(found.values())
+def _parse_us_search_dom(html: str) -> list[dict]:
+    """Fallback: parse rendered product cards (data-productid=…) from the DOM.
+
+    Current mercari.com renders search results client-side, so the data is only
+    in the HTML: each card carries data-productid, an <img alt="…"> title, and
+    a $-prefixed price. Emits dicts in the same shape the JSON walker yields
+    (price in DOLLARS as a string with no 'cents' ambiguity)."""
+    items: list[dict] = []
+    for m in re.finditer(r'data-productid="(m\d{8,})"', html):
+        iid = m.group(1)
+        seg = html[m.start():m.start() + 8000]
+        nxt = re.search(r'data-productid="m\d{8,}"', seg[20:])
+        if nxt:
+            seg = seg[:nxt.start() + 20]
+        alt = re.search(r'<img[^>]*\balt="([^"]+)"', seg)
+        # Anchor to the card's own price element (data-testid/class contains
+        # "Price") so we never grab shipping, strikethrough, or promo amounts;
+        # fall back to the first $ in the card segment only if that fails.
+        price = (re.search(r'Price[^$]{0,400}?\$\s?([\d,]+(?:\.\d\d)?)', seg)
+                 or re.search(r'\$\s?([\d,]+(?:\.\d\d)?)', seg))
+        if not alt or not price:
+            continue
+        title = _html.unescape(alt.group(1))
+        # img alt is "<listing title> - <brand>"; the trailing brand suffix is
+        # harmless for matching, keep as-is.
+        img = re.search(r'<img[^>]*\bsrcset="(https://[^\s"]+)', seg)
+        items.append({
+            "id":     iid,
+            "name":   title,
+            "price":  price.group(1).replace(",", ""),
+            "price_is_dollars": True,      # DOM prices are always dollars — never cents-convert
+            "photos": [{"thumbnail": img.group(1)}] if img else [],
+        })
+    return items
 
 
 def fetch_mercari_us_listings() -> list[dict]:
@@ -387,7 +426,9 @@ def fetch_mercari_us_listings() -> list[dict]:
                 price = float(it["price"])
             except (TypeError, ValueError):
                 continue
-            if price > 20000:            # cents-vs-dollars guard on unknown shapes
+            # Cents-vs-dollars guard applies ONLY to JSON-sourced values of
+            # unknown unit; DOM-parsed prices are explicitly dollars.
+            if not it.get("price_is_dollars") and price > 20000:
                 price = price / 100.0
             out.append({
                 "item_id":   f"mus-{iid}",
