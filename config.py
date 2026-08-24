@@ -128,6 +128,48 @@ SHOPIFY_GLOBAL_MIN_INTERVAL = 0.5  # min seconds between ANY two Shopify request
 SHOPIFY_PROXY_MAX_PAGES     = 2     # /products.json pages per PROXY store (direct uses SHOPIFY_MAX_PAGES)
 SHOPIFY_PROXY_SCAN_INTERVAL = 1800  # min seconds between proxy-store sweeps (30 min)
 
+
+# ---------------------------------------------------------------------------
+# Mercari sources (see mercari_source.py) — third product source.
+#   JP lane: Mercari Japan's official app API (DPoP-signed request, free, works
+#     from the datacenter IP — no proxy). Sealed Japanese Pokémon product only:
+#     titles are Japanese, so a curated JP→EN set-name matcher maps each listing
+#     to its tcgcsv "Pokemon Japan" (cat 85) sealed product for the deal test.
+#     Prices are JPY → converted to USD with a cached FX rate (fail-closed:
+#     no rate ⇒ the lane is skipped that cycle, never mispriced).
+#   US lane: mercari.com sits behind a JS-challenge wall (blocks datacenter AND
+#     residential-proxy plain HTTP), so it is fetched through the Scrapfly
+#     scraping API. Gated on SCRAPFLY_API_KEY — lane is skipped when unset.
+# ---------------------------------------------------------------------------
+MERCARI_JP_QUERIES = [
+    # Sealed-box focused searches; each is (game, keyword). Japanese keywords
+    # deliberately include 未開封/シュリンク (unopened / shrink-wrapped) signals.
+    ("pokemon", "ポケモンカード BOX シュリンク付き 未開封"),
+    ("pokemon", "ポケモンカード 拡張パック BOX 新品未開封"),
+]
+MERCARI_JP_PAGE_SIZE        = 60     # newest-first listings per query
+MERCARI_JP_REQUEST_INTERVAL = 2.0    # polite spacing between JP API calls (s)
+MERCARI_JP_MIN_PRICE_JPY    = 4000   # ignore loose packs / junk below this
+
+# USD↔JPY conversion for the JP lane (open.er-api.com, free, no key).
+FX_RATE_URL = "https://open.er-api.com/v6/latest/USD"
+FX_RATE_TTL = 6 * 3600               # refresh at most every 6h; stale rate kept on failure
+
+SCRAPFLY_API_KEY = os.environ.get("SCRAPFLY_API_KEY", "")
+MERCARI_US_QUERIES = [
+    # (game, keyword) — English titles flow through the normal eBay-style
+    # sealed/single evaluation, so broad sealed searches are enough.
+    ("pokemon",  "pokemon booster box sealed"),
+    ("pokemon",  "pokemon elite trainer box"),
+    ("mtg",      "mtg booster box sealed"),
+    ("lorcana",  "lorcana booster box sealed"),
+    ("onepiece", "one piece booster box sealed"),
+]
+MERCARI_US_SCAN_INTERVAL = 1800      # min seconds between US sweeps (Scrapfly credits)
+MERCARI_US_ASSUMED_SHIPPING = 8.00   # search data hides the buyer's shipping cost;
+                                     # assume a typical charge so the deal test stays
+                                     # conservative (never understate the total)
+
 # ---------------------------------------------------------------------------
 # Residential proxy (optional) — unlocks the Cloudflare-strict stores that 429
 # this datacenter IP on every request. Set RESIDENTIAL_PROXY_URL to a rotating
@@ -459,7 +501,10 @@ _GAME_PREFIXES = {
 # and match each listing by its OP/ST/EB/PRB card code (e.g. "OP01-024").
 # tcgcsv category ids per game (used by the One Piece singles index AND the
 # cross-game sealed-product price index further below).
-TCGCSV_CATEGORY = {"pokemon": 3, "mtg": 1, "lorcana": 71, "onepiece": 68}
+# "pokemon_jp" is a pseudo-game used ONLY by the sealed-price index so Mercari JP
+# boxes are priced against the Japanese category (85) instead of the English one.
+TCGCSV_CATEGORY = {"pokemon": 3, "mtg": 1, "lorcana": 71, "onepiece": 68,
+                   "pokemon_jp": 85}
 TCGCSV_ONEPIECE_CAT   = TCGCSV_CATEGORY["onepiece"]
 _OP_CODE_RE           = re.compile(r"\b((?:OP|ST|EB|PRB)\d{2}-\d{3})\b", re.IGNORECASE)
 _ONEPIECE_INDEX_TTL   = 6 * 3600   # rebuild the index at most every 6h on success

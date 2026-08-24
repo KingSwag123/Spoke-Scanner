@@ -64,7 +64,11 @@ from config import (
     PREMIUM_THRESHOLD,
     PRICED_GAMES,
     RESIDENTIAL_PROXY_URL,
+    MERCARI_JP_QUERIES,
+    MERCARI_US_QUERIES,
+    MERCARI_US_SCAN_INTERVAL,
     RESTOCK_WEBHOOK,
+    SCRAPFLY_API_KEY,
     SEALED_SANITY_FLOOR,
     SEEN_EXPIRY_DAYS,
     SEEN_FILE,
@@ -93,6 +97,10 @@ from discord_router import (
     send_restock_alert,
     send_sealed_alert,
     webhook_is_set,
+)
+from mercari_source import (
+    fetch_mercari_jp_listings,
+    fetch_mercari_us_listings,
 )
 from shopify_source import (
     cleanup_availability,
@@ -339,6 +347,21 @@ def scan_open_market(seen: dict, availability: dict) -> None:
         shopify_deal += 1
     print(f"[SHOPIFY] {len(shopify_all)} variants | {restock_alerts} restock alert(s) | "
           f"{shopify_deal} available USD sealed variant(s) → deal pipeline")
+
+    # 1c) Mercari lanes — JP (free API, sealed JP boxes pre-mapped to tcgcsv
+    #     names) and US (Scrapfly-fetched, evaluated like eBay). Both normalize
+    #     to the common listing shape; per-listing errors are already handled
+    #     inside each fetcher, and the whole lane must never abort the cycle.
+    for fetcher, label in ((fetch_mercari_jp_listings, "Mercari JP"),
+                           (fetch_mercari_us_listings, "Mercari US")):
+        try:
+            for it in fetcher():
+                if it["item_id"] in cycle_ids:
+                    continue
+                cycle_ids.add(it["item_id"])
+                listings.append(it)
+        except Exception as e:   # defensive — a source outage isn't a cycle abort
+            print(f"  [{label}][ERROR] gather failed: {type(e).__name__}: {e}")
     t_shopify = time.monotonic()
 
     print(f"[SCAN] {len(listings)} unique listings to evaluate")
@@ -366,7 +389,10 @@ def scan_open_market(seen: dict, availability: dict) -> None:
             if price < MIN_PRICE_FLOOR:
                 drop["floor"] += 1
                 continue
-            if not is_allowed_language(title):
+            # Language filter: keyword-based, tuned for English titles. The JP
+            # lane is Japanese BY DESIGN (priced against the Japanese market),
+            # so it bypasses this check.
+            if item.get("source") != "mercari_jp" and not is_allowed_language(title):
                 drop["language"] += 1
                 continue
             # Seller-trust is an eBay-only signal (feedback score/%). Curated
@@ -378,11 +404,18 @@ def scan_open_market(seen: dict, availability: dict) -> None:
             # 3) Sealed products: look up the sealed market price and apply the same
             #    deal test as singles (total <= market × DEAL_RATIO). Routes to that
             #    game's #sealed channel; unmatched/over-priced sealed is dropped.
-            if is_sealed(title):
+            #    Mercari JP listings force the sealed path (is_sealed can't read
+            #    Japanese) and are priced against the JAPANESE sealed catalog
+            #    (tcgcsv cat 85) via their pre-mapped English product phrase —
+            #    JP boxes trade in a different market than English product.
+            if is_sealed(title) or item.get("sealed"):
                 if is_seen(item_id, seen):
                     drop["seen"] += 1
                     continue
-                match = fetch_sealed_price(game, title)
+                if item.get("source") == "mercari_jp":
+                    match = fetch_sealed_price("pokemon_jp", item.get("en_title") or title)
+                else:
+                    match = fetch_sealed_price(game, title)
                 if not match:
                     drop["nomatch"] += 1
                     print(f"  [NOMATCH] ${price:.2f} {game} sealed — {title[:48]}")
@@ -573,6 +606,13 @@ def main() -> None:
     else:
         print(f"[START] Discord posting: DRY-RUN — workspace copy, sends nothing "
               f"(only the Deployment posts; set DISCORD_LIVE=1 to override)")
+    print(f"[START] Mercari JP: {len(MERCARI_JP_QUERIES)} sealed-box quer(ies) via official API "
+          f"(JPY→USD, priced vs Japanese sealed catalog)")
+    if SCRAPFLY_API_KEY:
+        print(f"[START] Mercari US: ACTIVE via Scrapfly — {len(MERCARI_US_QUERIES)} quer(ies) "
+              f"every {MERCARI_US_SCAN_INTERVAL // 60} min")
+    else:
+        print(f"[START] Mercari US: idle — set SCRAPFLY_API_KEY to enable the Cloudflare-solving lane")
     _proxy_stores  = [s for s in SHOPIFY_STORES if s.get("proxy")]
     _direct_stores = [s for s in SHOPIFY_STORES if not s.get("proxy")]
     if shopify_proxies() is not None:
