@@ -289,6 +289,9 @@ def fetch_mercari_jp_listings() -> list[dict]:
 # US lane — mercari.com via Scrapfly (anti-bot + JS rendering)
 # ---------------------------------------------------------------------------
 _last_us_scan: float | None = None
+_us_parser_healthy = True
+_us_consecutive_failures = 0
+_US_UNHEALTHY_RETRY_INTERVAL = 600  # low-cost recovery probe every 10 minutes
 
 
 def _scrapfly_get(url: str) -> str | None:
@@ -398,17 +401,22 @@ def fetch_mercari_us_listings() -> list[dict]:
     MERCARI_US_SCAN_INTERVAL seconds to bound Scrapfly credit spend.
     English titles/USD prices go through the normal evaluation path in main.py.
     """
-    global _last_us_scan
+    global _last_us_scan, _us_parser_healthy, _us_consecutive_failures
     if not SCRAPFLY_API_KEY:
         return []
     now = time.monotonic()
-    if _last_us_scan is not None and (now - _last_us_scan) < MERCARI_US_SCAN_INTERVAL:
+    interval = (MERCARI_US_SCAN_INTERVAL if _us_parser_healthy
+                else _US_UNHEALTHY_RETRY_INTERVAL)
+    if _last_us_scan is not None and (now - _last_us_scan) < interval:
         return []
     _last_us_scan = now
 
     out: list[dict] = []
     seen_ids: set[str] = set()
-    for game, keyword in MERCARI_US_QUERIES:
+    # While unhealthy, spend only one metered request as a recovery probe.
+    # A successful probe restores normal full sweeps automatically.
+    queries = MERCARI_US_QUERIES if _us_parser_healthy else MERCARI_US_QUERIES[:1]
+    for game, keyword in queries:
         url = ("https://www.mercari.com/search/?keyword="
                + requests.utils.quote(keyword)
                + "&sortBy=2&itemStatuses=1")          # newest first, on sale
@@ -416,6 +424,25 @@ def fetch_mercari_us_listings() -> list[dict]:
         if not html:
             continue
         items = _parse_us_search(html)
+        if not items:
+            _us_consecutive_failures += 1
+            _us_parser_healthy = False
+            print(
+                "  [MERCARI-US][HEALTH] FAIL-CLOSED: page loaded but no "
+                f"listing format was recognized (failure {_us_consecutive_failures}). "
+                "Full sweep paused; one recovery probe will run every 10 min."
+            )
+            # All searches use the same page format. Stop now rather than
+            # spending four more Scrapfly requests that cannot parse.
+            break
+
+        if not _us_parser_healthy:
+            print(
+                f"  [MERCARI-US][HEALTH] RECOVERED: recognized {len(items)} "
+                "listings; normal full sweeps resumed."
+            )
+            _us_parser_healthy = True
+            _us_consecutive_failures = 0
         fresh = 0
         for it in items:
             iid = it["id"]

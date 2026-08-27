@@ -18,3 +18,5 @@ description: How the Mercari JP and US lanes work, what's blocked, and the pokem
 ## US lane parsing (Scrapfly)
 - Scrapfly (asp + render_js) does get past CF — 200, real page, ~400KB.
 - mercari.com's __NEXT_DATA__ script tag carries extra attributes (crossorigin) — match with [^>]*, and the blob contains NO item data (results fetched client-side). Parse the rendered DOM cards instead: data-productid="m…", img alt = title (HTML-escaped, unescape; suffixed " - <brand>"), $X.XX price in dollars, srcset first URL for image. JSON walker kept as primary in case they revert.
+- **Health rule:** if a page loads but no listing format is recognized, fail closed and stop that sweep immediately; while unhealthy, spend only one recovery-probe request every 10 minutes, then automatically resume normal full sweeps after a valid parse.
+- **Why:** all configured queries share Mercari's page format, so running the remaining searches after one parser failure only wastes metered Scrapfly credits and cannot yield safe alerts.
