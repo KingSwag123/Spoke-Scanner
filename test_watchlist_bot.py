@@ -32,6 +32,42 @@ class WatchlistStoreTests(unittest.TestCase):
         self.store.mark_delivered(watch.user_id, "listing-1")
         self.assertTrue(self.store.was_delivered(watch.user_id, "listing-1"))
 
+    def test_list_and_delete_watches_are_isolated_by_user(self):
+        self.store.upsert_watch(123, "Pikachu-V", 50)
+        self.store.upsert_watch(123, "Booster Box", 100)
+        self.store.upsert_watch(456, "Pikachu V", 75)
+
+        own = self.store.list_watches_for_user(123)
+        self.assertEqual(
+            [(watch.item_name, watch.max_price) for watch in own],
+            [("Booster Box", 100), ("Pikachu-V", 50)],
+        )
+        self.assertEqual(self.store.delete_watch(123, "pikachu v"), "Pikachu-V")
+        self.assertIsNone(self.store.delete_watch(123, "Pikachu-V"))
+        self.assertEqual(
+            [watch.item_name for watch in self.store.list_watches_for_user(123)],
+            ["Booster Box"],
+        )
+        self.assertEqual(
+            [watch.item_name for watch in self.store.list_watches_for_user(456)],
+            ["Pikachu V"],
+        )
+
+    def test_delete_watch_cancels_its_pending_alerts(self):
+        self.store.upsert_watch(123, "Pikachu V", 50)
+        self.store.enqueue_matches(
+            [{
+                "item_id": "pending-listing",
+                "title": "Pikachu-V Full Art",
+                "price": 40,
+                "shipping": 0,
+                "url": "https://example.com/pending",
+            }]
+        )
+        self.assertEqual(self.store.pending_count(), 1)
+        self.store.delete_watch(123, "Pikachu-V")
+        self.assertEqual(self.store.pending_count(), 0)
+
     def test_old_watch_keyed_delivery_history_is_migrated(self):
         legacy_path = str(Path(self.tmp.name) / "legacy.db")
         with sqlite3.connect(legacy_path) as conn:

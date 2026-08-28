@@ -211,6 +211,52 @@ class WatchlistStore:
             ).fetchall()
         return [Watch(**dict(row)) for row in rows]
 
+    def list_watches_for_user(self, user_id: int) -> list[Watch]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, item_name, normalized_name, max_price
+                FROM watchlists
+                WHERE user_id = ?
+                ORDER BY normalized_name
+                """,
+                (user_id,),
+            ).fetchall()
+        return [Watch(**dict(row)) for row in rows]
+
+    def delete_watch(self, user_id: int, item_name: str) -> str | None:
+        normalized = _normalize_term(item_name)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT item_name
+                FROM watchlists
+                WHERE user_id = ? AND normalized_name = ?
+                """,
+                (user_id, normalized),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "DELETE FROM watchlists "
+                "WHERE user_id = ? AND normalized_name = ?",
+                (user_id, normalized),
+            )
+            # Do not send alerts that were matched but not yet delivered before
+            # the user stopped this watch.
+            pending = conn.execute(
+                "SELECT item_id, item_name FROM pending_watch_dms WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+            for alert in pending:
+                if _normalize_term(alert["item_name"]) == normalized:
+                    conn.execute(
+                        "DELETE FROM pending_watch_dms "
+                        "WHERE user_id = ? AND item_id = ?",
+                        (user_id, alert["item_id"]),
+                    )
+        return str(row["item_name"])
+
     def was_delivered(self, user_id: int, item_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
@@ -395,6 +441,84 @@ class WatchlistBot(commands.Bot):
                 "including shipping. I'll DM you when a match appears.",
                 ephemeral=True,
             )
+
+        @self.tree.command(
+            name="unwatch",
+            description="Stop personal listing alerts for an item.",
+        )
+        @app_commands.describe(item_name="Item name from your active watches")
+        async def unwatch(
+            interaction: discord.Interaction,
+            item_name: app_commands.Range[str, 2, 100],
+        ) -> None:
+            try:
+                deleted_name = await asyncio.to_thread(
+                    self.store.delete_watch,
+                    interaction.user.id,
+                    item_name,
+                )
+            except sqlite3.Error:
+                print("[WATCHLIST][ERROR] Could not delete /unwatch entry")
+                await interaction.response.send_message(
+                    "I couldn't stop that watch right now. Please try again later.",
+                    ephemeral=True,
+                )
+                return
+            if deleted_name is None:
+                await interaction.response.send_message(
+                    "I couldn't find that item in your active watches. "
+                    "Use `/mywatches` to see the exact names you're tracking.",
+                    ephemeral=True,
+                )
+                return
+            safe_name = discord.utils.escape_markdown(deleted_name)
+            await interaction.response.send_message(
+                f"Stopped alerts for **{safe_name}**.",
+                ephemeral=True,
+            )
+
+        @self.tree.command(
+            name="mywatches",
+            description="Privately list all of your active personal alerts.",
+        )
+        async def mywatches(interaction: discord.Interaction) -> None:
+            try:
+                watches = await asyncio.to_thread(
+                    self.store.list_watches_for_user,
+                    interaction.user.id,
+                )
+            except sqlite3.Error:
+                print("[WATCHLIST][ERROR] Could not load /mywatches entries")
+                await interaction.response.send_message(
+                    "I couldn't load your watches right now. Please try again later.",
+                    ephemeral=True,
+                )
+                return
+            if not watches:
+                await interaction.response.send_message(
+                    "You aren't tracking anything yet. Use `/watch` to add an alert.",
+                    ephemeral=True,
+                )
+                return
+
+            lines = [
+                f"• **{discord.utils.escape_markdown(entry.item_name)}** — "
+                f"${entry.max_price:,.2f} max"
+                for entry in watches
+            ]
+            chunks: list[str] = []
+            current = "**Your active watches**\n"
+            for line in lines:
+                if len(current) + len(line) + 1 > 1900:
+                    chunks.append(current)
+                    current = line
+                else:
+                    current += ("\n" if current else "") + line
+            if current:
+                chunks.append(current)
+            await interaction.response.send_message(chunks[0], ephemeral=True)
+            for chunk in chunks[1:]:
+                await interaction.followup.send(chunk, ephemeral=True)
 
     async def setup_hook(self) -> None:
         synced = await self.tree.sync()
