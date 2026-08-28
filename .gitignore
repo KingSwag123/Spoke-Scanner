@@ -5,3 +5,8 @@ __pycache__/
 # Workspace (dry-run) runtime state — kept separate from the committed
 # production seed so dev's simulated "seen" items never seed the Deployment.
 *.local.json
+
+# Runtime watchlist state (contains Discord user IDs; never commit it).
+watchlists.db
+watchlists.db-shm
+watchlists.db-wal

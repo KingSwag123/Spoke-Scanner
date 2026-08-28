@@ -36,6 +36,8 @@ _STATE_SUFFIX = "" if _DISCORD_LIVE else ".local"
 # Config
 # ---------------------------------------------------------------------------
 SEEN_FILE        = f"seen_listings{_STATE_SUFFIX}.json"   # permanent dedup state; .local in dry-run
+WATCHLIST_DB_FILE = os.environ.get("WATCHLIST_DB_FILE", "watchlists.db")
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 
 CHECK_INTERVAL   = 300     # seconds between scan cycles (5 min)
 SEEN_EXPIRY_DAYS = 90      # drop seen entries older than this (anti-bloat)

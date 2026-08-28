@@ -51,6 +51,7 @@ import requests
 from config import (
     CHECK_INTERVAL,
     DEAL_RATIO,
+    DISCORD_BOT_TOKEN,
     EBAY_APP_ID,
     EBAY_BROWSE_URL,
     EBAY_CERT_ID,
@@ -82,6 +83,7 @@ from config import (
     SHOPIFY_STORES,
     SINGLE_SANITY_FLOOR,
     WEBHOOKS,
+    WATCHLIST_DB_FILE,
     shopify_proxies,
 )
 from api_engines import (
@@ -122,6 +124,7 @@ from shopify_source import (
     load_availability,
     save_availability,
 )
+from watchlist_bot import WatchlistBot, create_watchlist_bot
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +283,11 @@ def fetch_ebay_listings(keywords: str, limit: int = EBAY_STREAM_LIMIT) -> list[d
 # Scan cycle — broad streams → parse → live lookup → deal test → route
 # ---------------------------------------------------------------------------
 
-def scan_open_market(seen: dict, availability: dict) -> None:
+def scan_open_market(
+    seen: dict,
+    availability: dict,
+    watchlist_bot: WatchlistBot | None = None,
+) -> None:
     reset_cycle_cache()   # evict expired price-cache entries (prices persist across cycles via TTL)
     t_start = time.monotonic()
 
@@ -379,6 +386,10 @@ def scan_open_market(seen: dict, availability: dict) -> None:
     t_shopify = time.monotonic()
 
     print(f"[SCAN] {len(listings)} unique listings to evaluate")
+    if watchlist_bot is not None:
+        # Personal watches intentionally see every normalized marketplace
+        # listing, not only listings that pass the public deal/market filters.
+        watchlist_bot.submit_listings(listings)
 
     deals   = 0
     sealed_alerts = 0
@@ -660,12 +671,30 @@ def main() -> None:
 
     seen = load_seen()
     availability = load_availability()
+    watchlist_bot: WatchlistBot | None = None
+    if DISCORD_BOT_TOKEN and POST_TO_DISCORD:
+        try:
+            watchlist_bot = create_watchlist_bot(
+                DISCORD_BOT_TOKEN, WATCHLIST_DB_FILE
+            )
+            watchlist_bot.start_in_background()
+            print("[START] Personal watchlist bot: starting (/watch enabled)")
+        except Exception as exc:
+            print(
+                f"[WATCHLIST][ERROR] Bot initialization failed: "
+                f"{type(exc).__name__}"
+            )
+            watchlist_bot = None
+    elif DISCORD_BOT_TOKEN:
+        print("[START] Personal watchlist bot: idle in workspace dry-run")
+    else:
+        print("[START] Personal watchlist bot: idle — DISCORD_BOT_TOKEN is unset")
 
     while True:
         try:
             seen = cleanup_seen(seen)
             availability = cleanup_availability(availability)
-            scan_open_market(seen, availability)
+            scan_open_market(seen, availability, watchlist_bot)
         except Exception as e:
             print(f"[ERROR] {e}")
 
