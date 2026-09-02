@@ -1,4 +1,4 @@
-"""Discord slash-command bot and SQLite-backed personal listing watchlists."""
+"""Discord slash-command bot with persistent personal listing watchlists."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable
 
 import discord
+import psycopg
 from discord import app_commands
 from discord.ext import commands
 
@@ -393,10 +394,10 @@ class WatchlistStore:
 
 
 class WatchlistBot(commands.Bot):
-    def __init__(self, token: str, db_path: str):
+    def __init__(self, token: str, db_path: str, store=None):
         super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.none())
         self.token_value = token
-        self.store = WatchlistStore(db_path)
+        self.store = store or WatchlistStore(db_path)
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._last_health_warning = 0.0
@@ -429,7 +430,7 @@ class WatchlistBot(commands.Bot):
                     cleaned,
                     float(max_price),
                 )
-            except sqlite3.Error:
+            except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not save /watch entry")
                 await interaction.response.send_message(
                     "I couldn't save that watch right now. Please try again later.",
@@ -457,7 +458,7 @@ class WatchlistBot(commands.Bot):
                     interaction.user.id,
                     item_name,
                 )
-            except sqlite3.Error:
+            except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not delete /unwatch entry")
                 await interaction.response.send_message(
                     "I couldn't stop that watch right now. Please try again later.",
@@ -487,7 +488,7 @@ class WatchlistBot(commands.Bot):
                     self.store.list_watches_for_user,
                     interaction.user.id,
                 )
-            except sqlite3.Error:
+            except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not load /mywatches entries")
                 await interaction.response.send_message(
                     "I couldn't load your watches right now. Please try again later.",
@@ -570,7 +571,7 @@ class WatchlistBot(commands.Bot):
             queued = self.store.enqueue_matches(listings)
             if queued:
                 print(f"[WATCHLIST] Persisted {queued} pending personal alert(s)")
-        except (sqlite3.Error, TypeError, ValueError) as exc:
+        except (sqlite3.Error, psycopg.Error, TypeError, ValueError) as exc:
             print(
                 f"[WATCHLIST][ERROR] Could not queue listing matches: "
                 f"{type(exc).__name__}"
@@ -666,10 +667,23 @@ class WatchlistBot(commands.Bot):
         except (discord.Forbidden, discord.NotFound):
             print(f"[WATCHLIST][WARN] Cannot DM Discord user {watch.user_id}")
             return "permanent"
-        except (discord.HTTPException, sqlite3.Error) as exc:
+        except (discord.HTTPException, sqlite3.Error, psycopg.Error) as exc:
             print(f"[WATCHLIST][WARN] DM delivery failed: {type(exc).__name__}")
         return "retry"
 
 
 def create_watchlist_bot(token: str, db_path: str) -> WatchlistBot:
-    return WatchlistBot(token=token, db_path=db_path)
+    from watchlist_postgres import PostgresWatchlistStore
+
+    store = PostgresWatchlistStore()
+    imported_watches, imported_deliveries, imported_pending = (
+        store.import_sqlite(db_path)
+    )
+    if imported_watches or imported_deliveries or imported_pending:
+        print(
+            f"[WATCHLIST] Imported {imported_watches} legacy watch(es) and "
+            f"{imported_deliveries} delivery record(s), with "
+            f"{imported_pending} pending alert(s), into PostgreSQL"
+        )
+    print("[WATCHLIST] Persistent PostgreSQL storage active")
+    return WatchlistBot(token=token, db_path=db_path, store=store)

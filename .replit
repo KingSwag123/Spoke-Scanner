@@ -1,11 +1,11 @@
-modules = ["python-3.11"]
+modules = ["python-3.11", "postgresql-16"]
 [agent]
 expertMode = true
 stack = "BEST_EFFORT_FALLBACK"
 
 [nix]
 channel = "stable-25_05"
-packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "rustc"]
+packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "postgresql", "rustc"]
 
 [workflows]
 runButton = "Project"
