@@ -521,8 +521,17 @@ class WatchlistBot(commands.Bot):
                 await interaction.followup.send(chunk, ephemeral=True)
 
     async def setup_hook(self) -> None:
-        synced = await self.tree.sync()
-        print(f"[WATCHLIST] Synced {len(synced)} global slash command(s)")
+        # A transient command-registration failure must not prevent the gateway
+        # connection or pending-DM worker from starting. Existing commands keep
+        # working and registration will be retried on the next process restart.
+        try:
+            synced = await self.tree.sync()
+            print(f"[WATCHLIST] Synced {len(synced)} global slash command(s)")
+        except discord.HTTPException as exc:
+            print(
+                f"[WATCHLIST][WARN] Slash command sync failed: "
+                f"{type(exc).__name__}; bot startup will continue"
+            )
         self.loop.create_task(self._listing_worker())
 
     async def on_ready(self) -> None:
@@ -531,6 +540,13 @@ class WatchlistBot(commands.Bot):
 
     async def on_disconnect(self) -> None:
         self._ready.clear()
+
+    async def on_resumed(self) -> None:
+        # Discord may resume the existing gateway session without sending a new
+        # READY event. Restore health so normal reconnects are not reported as
+        # a permanently unavailable watchlist bot.
+        self._ready.set()
+        print("[WATCHLIST] Discord gateway session resumed")
 
     def start_in_background(self) -> None:
         if self._thread and self._thread.is_alive():

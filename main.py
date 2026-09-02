@@ -678,7 +678,10 @@ def main() -> None:
                 DISCORD_BOT_TOKEN, WATCHLIST_DB_FILE
             )
             watchlist_bot.start_in_background()
-            print("[START] Personal watchlist bot: starting (/watch enabled)")
+            print(
+                "[START] Personal watchlist bot: starting "
+                "(/watch, /unwatch, /mywatches enabled)"
+            )
         except Exception as exc:
             print(
                 f"[WATCHLIST][ERROR] Bot initialization failed: "
