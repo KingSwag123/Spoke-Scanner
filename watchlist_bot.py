@@ -697,8 +697,16 @@ class WatchlistBot(commands.Bot):
             if not comps:
                 return
             embed.add_field(
+                name="Recent eBay Avg Sold",
+                value=(
+                    f"${comps['average']:,.2f}\n"
+                    f"*{comps['count']} completed sales*"
+                ),
+                inline=True,
+            )
+            embed.add_field(
                 name="Recent eBay Sold Comps",
-                value=format_sold_comps(comps),
+                value=format_sold_comps(comps, include_average=False),
                 inline=False,
             )
             await message.edit(embed=embed)

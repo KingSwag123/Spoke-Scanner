@@ -3,6 +3,9 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import discord
 
 from watchlist_bot import WatchlistBot, WatchlistStore
 
@@ -186,6 +189,37 @@ class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):
         }
         await self.bot._process_batch([item])
         self.assertEqual(self.sent, [(123, "punctuation", 20)])
+
+    @patch("watchlist_bot.get_sold_comps")
+    async def test_personal_dm_enrichment_has_one_average_and_one_detail(
+        self, lookup
+    ):
+        lookup.return_value = {
+            "average": 280,
+            "median": 275,
+            "count": 3,
+            "sales": [
+                {"total": 270, "url": "https://example.com/1"},
+                {"total": 275, "url": "https://example.com/2"},
+                {"total": 295, "url": "https://example.com/3"},
+            ],
+        }
+        message = AsyncMock()
+        embed = discord.Embed(title="Watchlist match")
+        await self.bot._enrich_watch_dm(
+            message,
+            embed,
+            {
+                "title": "Surging Sparks Booster Box",
+                "language": "English",
+                "sealed": True,
+            },
+        )
+        names = [field["name"] for field in embed.to_dict()["fields"]]
+        self.assertEqual(names.count("Recent eBay Avg Sold"), 1)
+        self.assertEqual(names.count("Recent eBay Sold Comps"), 1)
+        self.assertIn("$280.00", embed.to_dict()["fields"][0]["value"])
+        message.edit.assert_awaited_once_with(embed=embed)
 
     async def test_submission_persists_while_bot_is_not_ready(self):
         item = {

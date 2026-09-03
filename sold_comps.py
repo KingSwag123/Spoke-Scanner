@@ -442,15 +442,19 @@ def get_sold_comps(
                 event.set()
 
 
-def format_sold_comps(comps: dict) -> str:
+def format_sold_comps(comps: dict, *, include_average: bool = True) -> str:
     """Format a compact Discord field with linked recent sold totals."""
     links = []
     for sale in comps["sales"]:
         price = f"${sale['total']:,.2f}"
         links.append(f"[{price}]({sale['url']})" if sale.get("url") else price)
-    return (
+    summary = (
         f"**Avg total: ${comps['average']:,.2f}** • "
         f"Median: ${comps['median']:,.2f}\n"
+        if include_average
+        else f"Median: ${comps['median']:,.2f}\n"
+    )
+    return summary + (
         f"Last {comps['count']}: {' • '.join(links)}\n"
         "*U.S. eBay completed sales; price + shipping when published*"
     )

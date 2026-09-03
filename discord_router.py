@@ -29,6 +29,8 @@ _COMPS_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="sold-comps",
 )
+_SOLD_AVG_FIELD = "📈  Recent eBay Avg Sold"
+_SOLD_DETAIL_FIELD = "🧾  Recent eBay Sold Comps"
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +85,36 @@ def _edit_with_sold_comps(
     if not comps:
         return
     updated = deepcopy(embed)
-    updated.setdefault("fields", []).append({
-        "name": "📈  Recent eBay Sold Comps",
-        "value": format_sold_comps(comps),
+    fields = [
+        field for field in updated.setdefault("fields", [])
+        if field.get("name") not in {_SOLD_AVG_FIELD, _SOLD_DETAIL_FIELD}
+    ]
+    average_field = {
+        "name": _SOLD_AVG_FIELD,
+        "value": (
+            f"${comps['average']:,.2f}\n"
+            f"*{comps['count']} completed sales*"
+        ),
+        "inline": True,
+    }
+    tcg_index = next(
+        (
+            index for index, field in enumerate(fields)
+            if field.get("name") == "📊  TCGplayer Market Price"
+        ),
+        None,
+    )
+    if tcg_index is not None:
+        # This makes the first price row Listing | TCGplayer | eBay average.
+        fields.insert(tcg_index + 1, average_field)
+    else:
+        fields.append(average_field)
+    fields.append({
+        "name": _SOLD_DETAIL_FIELD,
+        "value": format_sold_comps(comps, include_average=False),
         "inline": False,
     })
+    updated["fields"] = fields
     parts = urlsplit(webhook_url)
     edit_path = parts.path.rstrip("/") + f"/messages/{message_id}"
     edit_url = urlunsplit((parts.scheme, parts.netloc, edit_path, parts.query, ""))

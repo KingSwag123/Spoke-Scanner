@@ -228,7 +228,33 @@ class SoldCompMatchingTests(unittest.TestCase):
         _edit_with_sold_comps(
             "https://discord.com/api/webhooks/1/token",
             "123",
-            {"fields": []},
+            {"fields": [
+                {
+                    "name": "💰  Listing Price",
+                    "value": "$200.00",
+                    "inline": True,
+                },
+                {
+                    "name": "📊  TCGplayer Market Price",
+                    "value": "$300.00",
+                    "inline": True,
+                },
+                {
+                    "name": "💸  Discount",
+                    "value": "Save $100",
+                    "inline": True,
+                },
+                {
+                    "name": "📈  Recent eBay Avg Sold",
+                    "value": "$1.00",
+                    "inline": True,
+                },
+                {
+                    "name": "🧾  Recent eBay Sold Comps",
+                    "value": "stale",
+                    "inline": False,
+                },
+            ]},
             {
                 "identity": "Surging Sparks Booster Box",
                 "listing_title": "Surging Sparks Booster Box",
@@ -240,9 +266,25 @@ class SoldCompMatchingTests(unittest.TestCase):
         payload = patch_request.call_args.kwargs["json"]
         self.assertTrue(url.endswith("/messages/123"))
         self.assertEqual(
-            payload["embeds"][0]["fields"][0]["name"],
-            "📈  Recent eBay Sold Comps",
+            [field["name"] for field in payload["embeds"][0]["fields"][:4]],
+            [
+                "💰  Listing Price",
+                "📊  TCGplayer Market Price",
+                "📈  Recent eBay Avg Sold",
+                "💸  Discount",
+            ],
         )
+        self.assertIn(
+            "Median: $280.00",
+            payload["embeds"][0]["fields"][-1]["value"],
+        )
+        self.assertNotIn(
+            "Avg total",
+            payload["embeds"][0]["fields"][-1]["value"],
+        )
+        names = [field["name"] for field in payload["embeds"][0]["fields"]]
+        self.assertEqual(names.count("📈  Recent eBay Avg Sold"), 1)
+        self.assertEqual(names.count("🧾  Recent eBay Sold Comps"), 1)
 
     @patch("discord_router.POST_TO_DISCORD", True)
     @patch("discord_router._COMPS_EXECUTOR.submit", side_effect=RuntimeError)
@@ -264,3 +306,5 @@ class SoldCompMatchingTests(unittest.TestCase):
                 "sealed": True,
             },
         ))
+        post.assert_called_once()
+        _submit.assert_called_once()
