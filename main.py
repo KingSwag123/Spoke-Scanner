@@ -82,6 +82,7 @@ from config import (
     SHOPIFY_PROXY_SCAN_INTERVAL,
     SHOPIFY_STORES,
     SINGLE_SANITY_FLOOR,
+    SOLD_COMPS_DAILY_LOOKUP_LIMIT,
     WEBHOOKS,
     WATCHLIST_DB_FILE,
     shopify_proxies,
@@ -640,6 +641,10 @@ def main() -> None:
     print(f"[START] Dedup: permanent per listing ID | Check interval: {CHECK_INTERVAL // 60} min")
     if POST_TO_DISCORD:
         print(f"[START] Discord posting: LIVE — this instance delivers alerts")
+        print(
+            "[START] Recent sold comps: ACTIVE via Apify — async ping updates, "
+            f"max {SOLD_COMPS_DAILY_LOOKUP_LIMIT} uncached lookups/day"
+        )
     else:
         print(f"[START] Discord posting: DRY-RUN — workspace copy, sends nothing "
               f"(only the Deployment posts; set DISCORD_LIVE=1 to override)")

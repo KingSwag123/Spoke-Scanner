@@ -7,6 +7,9 @@ graded-slab classifier, which it imports from `api_engines`.
 """
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -19,6 +22,13 @@ from config import (
     WEBHOOKS,
 )
 from api_engines import is_graded_slab
+from sold_comps import format_sold_comps, get_sold_comps
+
+
+_COMPS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="sold-comps",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +69,43 @@ def determine_channel(
 # Discord alert — rich embed (listing price, shipping, market, % discount)
 # ---------------------------------------------------------------------------
 
-def _post_embed(webhook_url: str, embed: dict, channel: str, game_name: str) -> bool:
+def _edit_with_sold_comps(
+    webhook_url: str,
+    message_id: str,
+    embed: dict,
+    context: dict,
+) -> None:
+    try:
+        comps = get_sold_comps(**context)
+    except Exception as exc:
+        print(f"  [SOLD-COMPS][WARN] Enrichment failed: {type(exc).__name__}")
+        return
+    if not comps:
+        return
+    updated = deepcopy(embed)
+    updated.setdefault("fields", []).append({
+        "name": "📈  Recent eBay Sold Comps",
+        "value": format_sold_comps(comps),
+        "inline": False,
+    })
+    parts = urlsplit(webhook_url)
+    edit_path = parts.path.rstrip("/") + f"/messages/{message_id}"
+    edit_url = urlunsplit((parts.scheme, parts.netloc, edit_path, parts.query, ""))
+    try:
+        response = requests.patch(edit_url, json={"embeds": [updated]}, timeout=10)
+        response.raise_for_status()
+        print(f"  [SOLD-COMPS] Added {comps['count']} recent sale(s) to ping")
+    except requests.RequestException as exc:
+        print(f"  [SOLD-COMPS][WARN] Ping update failed: {type(exc).__name__}")
+
+
+def _post_embed(
+    webhook_url: str,
+    embed: dict,
+    channel: str,
+    game_name: str,
+    sold_context: dict | None = None,
+) -> bool:
     """POST a single embed; return True only on confirmed 2xx delivery.
 
     In the workspace this runs in DRY-RUN (POST_TO_DISCORD is False): nothing is
@@ -71,9 +117,30 @@ def _post_embed(webhook_url: str, embed: dict, channel: str, game_name: str) -> 
               f"(workspace copy; set DISCORD_LIVE=1 to post for real)")
         return True
     try:
-        resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        resp = requests.post(
+            webhook_url,
+            params={"wait": "true"} if sold_context else None,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
         resp.raise_for_status()
         print(f"  [OK] Discord embed sent → #{game_name}/{channel}")
+        if sold_context:
+            try:
+                message_id = str(resp.json().get("id") or "")
+            except (requests.JSONDecodeError, ValueError, TypeError):
+                message_id = ""
+            if message_id:
+                try:
+                    _COMPS_EXECUTOR.submit(
+                        _edit_with_sold_comps,
+                        webhook_url,
+                        message_id,
+                        embed,
+                        sold_context,
+                    )
+                except RuntimeError:
+                    print("  [SOLD-COMPS][WARN] Enrichment worker unavailable")
         return True
     except requests.RequestException as e:
         print(f"  [ERROR] Discord alert failed (#{game_name}/{channel}): {e}")
@@ -131,7 +198,18 @@ def send_discord_alert(
     if image_url:
         embed["thumbnail"] = {"url": image_url}
 
-    return _post_embed(webhook_url, embed, channel, game_name)
+    return _post_embed(
+        webhook_url,
+        embed,
+        channel,
+        game_name,
+        sold_context={
+            "identity": matched_name or title,
+            "listing_title": title,
+            "language": language,
+            "sealed": False,
+        },
+    )
 
 
 def send_sealed_alert(
@@ -192,7 +270,18 @@ def send_sealed_alert(
     if image_url:
         embed["thumbnail"] = {"url": image_url}
 
-    return _post_embed(webhook_url, embed, "sealed", game_name)
+    return _post_embed(
+        webhook_url,
+        embed,
+        "sealed",
+        game_name,
+        sold_context={
+            "identity": matched_name or en_title or title,
+            "listing_title": en_title or title,
+            "language": language,
+            "sealed": True,
+        },
+    )
 
 
 def send_restock_alert(
@@ -236,4 +325,15 @@ def send_restock_alert(
     if image_url:
         embed["thumbnail"] = {"url": image_url}
 
-    return _post_embed(webhook_url, embed, channel, game_name)
+    return _post_embed(
+        webhook_url,
+        embed,
+        channel,
+        game_name,
+        sold_context={
+            "identity": title,
+            "listing_title": title,
+            "language": language,
+            "sealed": True,
+        },
+    )

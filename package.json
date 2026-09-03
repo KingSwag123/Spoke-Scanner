@@ -1,0 +1,8 @@
+{
+  "name": "spoke-scanner-connectors",
+  "private": true,
+  "description": "Connector helper dependencies for the Python scanner",
+  "dependencies": {
+    "@replit/connectors-sdk": "^0.4.3"
+  }
+}

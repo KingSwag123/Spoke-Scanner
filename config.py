@@ -38,6 +38,12 @@ _STATE_SUFFIX = "" if _DISCORD_LIVE else ".local"
 SEEN_FILE        = f"seen_listings{_STATE_SUFFIX}.json"   # permanent dedup state; .local in dry-run
 WATCHLIST_DB_FILE = os.environ.get("WATCHLIST_DB_FILE", "watchlists.db")
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+SOLD_COMPS_CACHE_FILE = f"sold_comps_cache{_STATE_SUFFIX}.json"
+SOLD_COMPS_CACHE_TTL = 86_400
+SOLD_COMPS_EMPTY_TTL = 21_600
+# The selected actor returns at most 12 rows (~$0.048) per lookup. This daily
+# cap bounds enrichment spend to roughly $0.72/day before Apify plan charges.
+SOLD_COMPS_DAILY_LOOKUP_LIMIT = 15
 
 CHECK_INTERVAL   = 300     # seconds between scan cycles (5 min)
 SEEN_EXPIRY_DAYS = 90      # drop seen entries older than this (anti-bloat)

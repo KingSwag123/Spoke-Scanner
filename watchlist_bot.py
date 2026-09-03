@@ -17,6 +17,8 @@ import psycopg
 from discord import app_commands
 from discord.ext import commands
 
+from sold_comps import format_sold_comps, get_sold_comps
+
 
 def _normalize_term(value: str) -> str:
     # Treat punctuation as a separator so "Pikachu-V" matches "Pikachu V",
@@ -401,6 +403,7 @@ class WatchlistBot(commands.Bot):
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._last_health_warning = 0.0
+        self._enrichment_tasks: set[asyncio.Task] = set()
         self._register_commands()
 
     def _register_commands(self) -> None:
@@ -662,7 +665,12 @@ class WatchlistBot(commands.Bot):
             image_url = str(item.get("image_url") or "")
             if image_url:
                 embed.set_thumbnail(url=image_url)
-            await user.send(embed=embed)
+            message = await user.send(embed=embed)
+            task = self.loop.create_task(
+                self._enrich_watch_dm(message, embed, item)
+            )
+            self._enrichment_tasks.add(task)
+            task.add_done_callback(self._enrichment_tasks.discard)
             return "sent"
         except (discord.Forbidden, discord.NotFound):
             print(f"[WATCHLIST][WARN] Cannot DM Discord user {watch.user_id}")
@@ -670,6 +678,39 @@ class WatchlistBot(commands.Bot):
         except (discord.HTTPException, sqlite3.Error, psycopg.Error) as exc:
             print(f"[WATCHLIST][WARN] DM delivery failed: {type(exc).__name__}")
         return "retry"
+
+    async def _enrich_watch_dm(
+        self,
+        message: discord.Message,
+        embed: discord.Embed,
+        item: dict,
+    ) -> None:
+        try:
+            title = str(item.get("title") or "")
+            comps = await asyncio.to_thread(
+                get_sold_comps,
+                title,
+                title,
+                str(item.get("language") or "Unknown"),
+                bool(item.get("sealed")),
+            )
+            if not comps:
+                return
+            embed.add_field(
+                name="Recent eBay Sold Comps",
+                value=format_sold_comps(comps),
+                inline=False,
+            )
+            await message.edit(embed=embed)
+            print(
+                f"[WATCHLIST] Added {comps['count']} recent sale(s) "
+                "to personal ping"
+            )
+        except Exception as exc:
+            print(
+                f"[WATCHLIST][WARN] Sold-comp update failed: "
+                f"{type(exc).__name__}"
+            )
 
 
 def create_watchlist_bot(token: str, db_path: str) -> WatchlistBot:
