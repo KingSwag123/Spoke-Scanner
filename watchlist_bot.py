@@ -20,10 +20,49 @@ from discord.ext import commands
 from sold_comps import format_sold_comps, get_sold_comps
 
 
+_SUPPORTED_GAME_ALIASES = (
+    "pokemon",
+    "pokémon",
+    "magic the gathering",
+    "mtg",
+    "lorcana",
+    "one piece",
+    "onepiece",
+)
+
+_UNSUPPORTED_GAME_ALIASES = {
+    "yu gi oh": "Yu-Gi-Oh!",
+    "yugioh": "Yu-Gi-Oh!",
+    "digimon": "Digimon",
+    "flesh and blood": "Flesh and Blood",
+    "fab tcg": "Flesh and Blood",
+    "star wars unlimited": "Star Wars: Unlimited",
+    "weiss schwarz": "Weiss Schwarz",
+    "cardfight vanguard": "Cardfight!! Vanguard",
+    "dragon ball super": "Dragon Ball Super",
+    "final fantasy tcg": "Final Fantasy TCG",
+    "union arena": "Union Arena",
+    "grand archive": "Grand Archive",
+    "altered tcg": "Altered TCG",
+    "riftbound": "Riftbound",
+}
+
+
 def _normalize_term(value: str) -> str:
     # Treat punctuation as a separator so "Pikachu-V" matches "Pikachu V",
     # while boundary-aware matching prevents "ex" from matching "box".
     return " ".join(re.sub(r"[\W_]+", " ", value.casefold()).split())
+
+
+def _unsupported_game_name(value: str) -> str | None:
+    normalized = f" {_normalize_term(value)} "
+    if any(f" {_normalize_term(alias)} " in normalized
+           for alias in _SUPPORTED_GAME_ALIASES):
+        return None
+    for alias, display_name in _UNSUPPORTED_GAME_ALIASES.items():
+        if f" {alias} " in normalized:
+            return display_name
+    return None
 
 
 @dataclass(frozen=True)
@@ -424,6 +463,15 @@ class WatchlistBot(commands.Bot):
             if len(_normalize_term(cleaned)) < 2:
                 await interaction.response.send_message(
                     "Give me at least two visible characters so I know what to scout for.",
+                    ephemeral=True,
+                )
+                return
+            unsupported_game = _unsupported_game_name(cleaned)
+            if unsupported_game:
+                await interaction.response.send_message(
+                    f"I can't scout **{unsupported_game}** yet. Right now I can "
+                    "watch Pokémon, Magic: The Gathering, Disney Lorcana, and "
+                    "One Piece. More games may join the hunt later!",
                     ephemeral=True,
                 )
                 return

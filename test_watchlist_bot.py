@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from watchlist_bot import WatchlistBot, WatchlistStore
+from watchlist_bot import WatchlistBot, WatchlistStore, _unsupported_game_name
 
 
 class WatchlistStoreTests(unittest.TestCase):
@@ -122,6 +122,24 @@ class WatchlistStoreTests(unittest.TestCase):
             }]
         )
         self.assertEqual(queued, 1)
+
+
+class WatchlistGameValidationTests(unittest.TestCase):
+    def test_recognizes_common_unsupported_games(self):
+        self.assertEqual(
+            _unsupported_game_name("Yu-Gi-Oh booster box"),
+            "Yu-Gi-Oh!",
+        )
+        self.assertEqual(
+            _unsupported_game_name("Star Wars Unlimited booster display"),
+            "Star Wars: Unlimited",
+        )
+        self.assertEqual(_unsupported_game_name("Digimon BT-20"), "Digimon")
+
+    def test_allows_supported_games_and_item_only_searches(self):
+        self.assertIsNone(_unsupported_game_name("Pokemon booster box"))
+        self.assertIsNone(_unsupported_game_name("MTG Final Fantasy booster box"))
+        self.assertIsNone(_unsupported_game_name("Pikachu V alternate art"))
 
 
 class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):
