@@ -409,7 +409,7 @@ class WatchlistBot(commands.Bot):
     def _register_commands(self) -> None:
         @self.tree.command(
             name="watch",
-            description="DM me when a matching listing is at or below my maximum price.",
+            description="Send your card-shop scout to find a listing within budget.",
         )
         @app_commands.describe(
             item_name="Words to match in the listing title",
@@ -423,7 +423,8 @@ class WatchlistBot(commands.Bot):
             cleaned = " ".join(item_name.split())
             if len(_normalize_term(cleaned)) < 2:
                 await interaction.response.send_message(
-                    "Please enter at least two visible characters.", ephemeral=True
+                    "Give me at least two visible characters so I know what to scout for.",
+                    ephemeral=True,
                 )
                 return
             try:
@@ -436,19 +437,22 @@ class WatchlistBot(commands.Bot):
             except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not save /watch entry")
                 await interaction.response.send_message(
-                    "I couldn't save that watch right now. Please try again later.",
+                    "My clipboard slipped—I couldn't save that watch. "
+                    "Please try again in a moment.",
                     ephemeral=True,
                 )
                 return
+            safe_name = discord.utils.escape_markdown(cleaned)
             await interaction.response.send_message(
-                f"Watching **{cleaned}** at **${float(max_price):,.2f} or less**, "
-                "including shipping. I'll DM you when a match appears.",
+                f"I'm on the hunt for **{safe_name}** at "
+                f"**${float(max_price):,.2f} or less**, including shipping. "
+                "I'll send you a DM if I spot one!",
                 ephemeral=True,
             )
 
         @self.tree.command(
             name="unwatch",
-            description="Stop personal listing alerts for an item.",
+            description="Call your card-shop scout off the hunt for an item.",
         )
         @app_commands.describe(item_name="Item name from your active watches")
         async def unwatch(
@@ -464,26 +468,27 @@ class WatchlistBot(commands.Bot):
             except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not delete /unwatch entry")
                 await interaction.response.send_message(
-                    "I couldn't stop that watch right now. Please try again later.",
+                    "I couldn't call off that hunt right now. "
+                    "Please try again in a moment.",
                     ephemeral=True,
                 )
                 return
             if deleted_name is None:
                 await interaction.response.send_message(
-                    "I couldn't find that item in your active watches. "
+                    "That one isn't on my scouting list. "
                     "Use `/mywatches` to see the exact names you're tracking.",
                     ephemeral=True,
                 )
                 return
             safe_name = discord.utils.escape_markdown(deleted_name)
             await interaction.response.send_message(
-                f"Stopped alerts for **{safe_name}**.",
+                f"Got it—I'm off the hunt for **{safe_name}**.",
                 ephemeral=True,
             )
 
         @self.tree.command(
             name="mywatches",
-            description="Privately list all of your active personal alerts.",
+            description="Check everything your card-shop scout is hunting.",
         )
         async def mywatches(interaction: discord.Interaction) -> None:
             try:
@@ -494,13 +499,14 @@ class WatchlistBot(commands.Bot):
             except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not load /mywatches entries")
                 await interaction.response.send_message(
-                    "I couldn't load your watches right now. Please try again later.",
+                    "I can't open my scouting notebook right now. "
+                    "Please try again in a moment.",
                     ephemeral=True,
                 )
                 return
             if not watches:
                 await interaction.response.send_message(
-                    "You aren't tracking anything yet. Use `/watch` to add an alert.",
+                    "My scouting list is empty. Use `/watch` and send me on a hunt!",
                     ephemeral=True,
                 )
                 return
@@ -511,7 +517,7 @@ class WatchlistBot(commands.Bot):
                 for entry in watches
             ]
             chunks: list[str] = []
-            current = "**Your active watches**\n"
+            current = "**My current scouting list**\n"
             for line in lines:
                 if len(current) + len(line) + 1 > 1900:
                     chunks.append(current)
@@ -636,10 +642,10 @@ class WatchlistBot(commands.Bot):
             user = self.get_user(watch.user_id) or await self.fetch_user(watch.user_id)
             shipping = float(item.get("shipping", 0))
             embed = discord.Embed(
-                title="Watchlist match",
+                title="Scout report: I found a match!",
                 description=f"[{item['title']}]({item['url']})",
                 url=item["url"],
-                color=0x5865F2,
+                color=0xF1C40F,
             )
             embed.add_field(name="Total", value=f"${total:,.2f}", inline=True)
             embed.add_field(
@@ -665,6 +671,9 @@ class WatchlistBot(commands.Bot):
             image_url = str(item.get("image_url") or "")
             if image_url:
                 embed.set_thumbnail(url=image_url)
+            embed.set_footer(
+                text="Your card-shop scout • Price includes listed shipping"
+            )
             message = await user.send(embed=embed)
             task = self.loop.create_task(
                 self._enrich_watch_dm(message, embed, item)
