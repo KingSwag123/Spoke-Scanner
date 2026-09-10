@@ -127,10 +127,6 @@ class WatchlistStoreTests(unittest.TestCase):
 class WatchlistGameValidationTests(unittest.TestCase):
     def test_recognizes_common_unsupported_games(self):
         self.assertEqual(
-            _unsupported_game_name("Yu-Gi-Oh booster box"),
-            "Yu-Gi-Oh!",
-        )
-        self.assertEqual(
             _unsupported_game_name("Star Wars Unlimited booster display"),
             "Star Wars: Unlimited",
         )
@@ -140,6 +136,8 @@ class WatchlistGameValidationTests(unittest.TestCase):
         self.assertIsNone(_unsupported_game_name("Pokemon booster box"))
         self.assertIsNone(_unsupported_game_name("MTG Final Fantasy booster box"))
         self.assertIsNone(_unsupported_game_name("Pikachu V alternate art"))
+        self.assertIsNone(_unsupported_game_name("Yu-Gi-Oh booster box"))
+        self.assertIsNone(_unsupported_game_name("Yugioh LOB-001 PSA 10"))
 
 
 class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):

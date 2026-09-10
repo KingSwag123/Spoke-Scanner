@@ -5,6 +5,20 @@ import discord_router
 
 
 class DiscordRoutingTests(unittest.TestCase):
+    def test_yugioh_uses_one_webhook_for_every_public_tier(self):
+        with patch.object(discord_router, "YUGIOH_WEBHOOK", "https://example.com/ygo"):
+            for title, sealed, market in (
+                ("Blue-Eyes White Dragon LOB-001", False, 10),
+                ("Blue-Eyes White Dragon LOB-001 PSA 10", False, 1000),
+                ("Legend of Blue Eyes Booster Box", True, 200),
+            ):
+                self.assertEqual(
+                    discord_router.determine_channel(
+                        "yugioh", title, sealed=sealed, market_price=market
+                    ),
+                    ("yugioh", "https://example.com/ygo"),
+                )
+
     def test_every_game_routes_to_its_correct_tier(self):
         slots = {
             game: {

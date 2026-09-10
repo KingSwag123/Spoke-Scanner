@@ -20,6 +20,7 @@ from config import (
     PREMIUM_THRESHOLD,
     WEBHOOK_PLACEHOLDER,
     WEBHOOKS,
+    YUGIOH_WEBHOOK,
 )
 from api_engines import is_graded_slab
 from sold_comps import format_sold_comps, get_sold_comps
@@ -57,6 +58,8 @@ def determine_channel(
     other singles route by the card's live market price. The URL may be
     empty/placeholder; callers must check webhook_is_set().
     """
+    if game_name == "yugioh":
+        return "yugioh", YUGIOH_WEBHOOK
     slots = WEBHOOKS.get(game_name, {})
     if sealed:
         channel = "sealed"

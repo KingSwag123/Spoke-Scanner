@@ -28,11 +28,11 @@ _SUPPORTED_GAME_ALIASES = (
     "lorcana",
     "one piece",
     "onepiece",
+    "yu gi oh",
+    "yugioh",
 )
 
 _UNSUPPORTED_GAME_ALIASES = {
-    "yu gi oh": "Yu-Gi-Oh!",
-    "yugioh": "Yu-Gi-Oh!",
     "digimon": "Digimon",
     "flesh and blood": "Flesh and Blood",
     "fab tcg": "Flesh and Blood",
@@ -470,8 +470,8 @@ class WatchlistBot(commands.Bot):
             if unsupported_game:
                 await interaction.response.send_message(
                     f"I can't scout **{unsupported_game}** yet. Right now I can "
-                    "watch Pokémon, Magic: The Gathering, Disney Lorcana, and "
-                    "One Piece. More games may join the hunt later!",
+                    "watch Pokémon, Magic: The Gathering, Disney Lorcana, "
+                    "One Piece, and Yu-Gi-Oh!. More games may join the hunt later!",
                     ephemeral=True,
                 )
                 return

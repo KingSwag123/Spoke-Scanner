@@ -2,7 +2,7 @@
 Multi-Game Open-Market Dynamic Lookup Engine
 --------------------------------------------
 Monitors broad "Buy It Now" streams of newly-listed TCG listings on eBay across
-four games (Pokémon, Magic: The Gathering, Lorcana, One Piece). Each listing is
+five games (Pokémon, Magic: The Gathering, Lorcana, One Piece, Yu-Gi-Oh!). Each listing is
 classified up front as either a SEALED product or a single card, and routed into
 that game's dedicated Discord channel via a hardcoded 3-tier webhook matrix.
 
@@ -23,9 +23,10 @@ A second source (shopify_source) scans curated TCG retailers' public Shopify
 /products.json each cycle: AVAILABLE USD SEALED variants flow through the same
 deal pipeline, and sealed out-of-stock → in-stock transitions fire restock alerts.
 
-Routing (3 tiers × 4 games = 12 channels) is read from the Secrets tab, one
+Routing for the original games (3 tiers × 4 games = 12 channels) is read from the Secrets tab, one
 secret per slot named GAME_TIER_WEBHOOK (e.g. MTG_PREMIUM_WEBHOOK). Any unset
-slot falls back to DISCORD_WEBHOOK_URL. Empty slots are skipped, never crash.
+slot falls back to DISCORD_WEBHOOK_URL. Yu-Gi-Oh uses only YUGIOH_WEBHOOK for
+every public alert type, including restocks. Empty slots are skipped, never crash.
 
 This module is the orchestrator: eBay OAuth + feed fetching, the permanent
 per-listing dedup store, the scan cycle, and the main loop. The TCG lookup
@@ -84,6 +85,7 @@ from config import (
     SINGLE_SANITY_FLOOR,
     SOLD_COMPS_DAILY_LOOKUP_LIMIT,
     WEBHOOKS,
+    YUGIOH_WEBHOOK,
     WATCHLIST_DB_FILE,
     shopify_proxies,
 )
@@ -94,6 +96,7 @@ from api_engines import (
     is_allowed_language,
     is_official_card,
     is_sealed,
+    is_yugioh_sealed,
     is_single_card,
     is_trusted_seller,
     parse_title,
@@ -322,7 +325,9 @@ def scan_open_market(
         game = it["game_name"]
         # Dedicated restock channel when configured (one channel for all games);
         # otherwise fall back to the game's #sealed channel (legacy behavior).
-        if webhook_is_set(RESTOCK_WEBHOOK):
+        if game == "yugioh":
+            rchannel, rwebhook = determine_channel(game, it["title"], sealed=True)
+        elif webhook_is_set(RESTOCK_WEBHOOK):
             rchannel, rwebhook = "restock", RESTOCK_WEBHOOK
         else:
             rchannel, rwebhook = determine_channel(game, it["title"], sealed=True)
@@ -358,7 +363,11 @@ def scan_open_market(
     for it in shopify_all:
         if not it["available"] or it.get("currency") != "USD":
             continue
-        if it["game_name"] is None or not is_sealed(it["title"]):
+        if it["game_name"] is None:
+            continue
+        if not (is_sealed(it["title"])
+                or (it["game_name"] == "yugioh"
+                    and is_yugioh_sealed(it["title"]))):
             continue
         if it["item_id"] in cycle_ids:
             continue
@@ -434,7 +443,9 @@ def scan_open_market(
             #    Japanese) and are priced against the JAPANESE sealed catalog
             #    (tcgcsv cat 85) via their pre-mapped English product phrase —
             #    JP boxes trade in a different market than English product.
-            if is_sealed(title) or item.get("sealed"):
+            if (is_sealed(title)
+                    or (game == "yugioh" and is_yugioh_sealed(title))
+                    or item.get("sealed")):
                 if is_seen(item_id, seen):
                     drop["seen"] += 1
                     continue
@@ -614,7 +625,7 @@ def main() -> None:
         print(f"[ERROR] Missing required env vars: {', '.join(missing)}")
         raise SystemExit(1)
 
-    # Report the 12-slot webhook matrix: which are filled vs. still placeholders.
+    # Report the original 12-slot matrix unchanged; Yu-Gi-Oh has one channel.
     filled = 0
     print(f"[START] Multi-Game Open-Market Dynamic Lookup Engine")
     print(f"[START] Webhook matrix (game × tier):")
@@ -626,11 +637,15 @@ def main() -> None:
             states.append(f"{tier}={'SET' if ok else 'empty'}")
         print(f"[START]   {game_name:9s} {' | '.join(states)}")
     print(f"[START] {filled}/12 webhook slots filled")
+    print(f"[START]   yugioh   single-channel={'SET' if webhook_is_set(YUGIOH_WEBHOOK) else 'empty'} "
+          f"(all public singles/graded/sealed/restock alerts)")
     if webhook_is_set(RESTOCK_WEBHOOK):
-        print(f"[START] Restock channel: SET → all games' retail restocks post to #restock")
+        print(f"[START] Restock channel: SET → original four games' retail restocks post to #restock "
+              f"(Yu-Gi-Oh always uses YUGIOH_WEBHOOK)")
     else:
-        print(f"[START] Restock channel: unset → restocks fall back to each game's #sealed")
-    if filled == 0:
+        print(f"[START] Restock channel: unset → original four games fall back to #sealed "
+              f"(Yu-Gi-Oh always uses YUGIOH_WEBHOOK)")
+    if filled == 0 and not webhook_is_set(YUGIOH_WEBHOOK):
         print("[WARN] No webhook slots are filled — nothing will be sent until you "
               "add at least one GAME_TIER_WEBHOOK (or DISCORD_WEBHOOK_URL) secret.")
     print(f"[START] Games: {', '.join(GAME_DISPLAY[g] for g in GAME_STREAMS)}")

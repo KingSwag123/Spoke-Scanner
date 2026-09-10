@@ -2,7 +2,8 @@
 Configuration for the Multi-Game Open-Market Dynamic Lookup Engine.
 
 Holds ALL tunable settings and module-level data for the price watcher:
-scan/deal thresholds, per-game eBay streams, the 3-tier × 4-game WEBHOOKS matrix,
+scan/deal thresholds, per-game eBay streams, the 3-tier × 4-game WEBHOOKS matrix
+plus Yu-Gi-Oh's single-channel webhook,
 API endpoints + credentials, HTTP headers, tcgcsv category ids, and the keyword
 indicator sets / regexes that the classifier and parser functions consume.
 
@@ -88,6 +89,14 @@ GAME_STREAMS = {
         "one piece booster box",
         "one piece booster case",
     ],
+    "yugioh": [
+        "yugioh card single",
+        "yu-gi-oh card single",
+        "yugioh card psa",
+        "yugioh booster box",
+        "yu-gi-oh structure deck sealed",
+        "yugioh sealed tin",
+    ],
 }
 
 # Human-readable game labels for Discord embeds and logs.
@@ -96,11 +105,13 @@ GAME_DISPLAY = {
     "mtg":      "Magic: The Gathering",
     "lorcana":  "Disney Lorcana",
     "onepiece": "One Piece",
+    "yugioh":   "Yu-Gi-Oh!",
 }
 
 # Pricing/deal-testing is wired up for every game with a live price source:
-#   pokemon → pokemontcg.io | mtg → Scryfall | lorcana → Lorcast | onepiece → tcgcsv
-PRICED_GAMES = {"pokemon", "mtg", "lorcana", "onepiece"}
+# pokemon → pokemontcg.io | mtg → Scryfall | lorcana → Lorcast |
+# onepiece/yugioh → tcgcsv (Yu-Gi-Oh requires exact printed set code)
+PRICED_GAMES = {"pokemon", "mtg", "lorcana", "onepiece", "yugioh"}
 
 # ---------------------------------------------------------------------------
 # Shopify retail source (see shopify_source.py) — a second product source that
@@ -172,6 +183,8 @@ MERCARI_US_QUERIES = [
     ("mtg",      "mtg booster box sealed"),
     ("lorcana",  "lorcana booster box sealed"),
     ("onepiece", "one piece booster box sealed"),
+    ("yugioh",  "yugioh booster box sealed"),
+    ("yugioh",  "yugioh structure deck sealed"),
 ]
 MERCARI_US_SCAN_INTERVAL = 1800      # min seconds between US sweeps (Scrapfly credits)
 MERCARI_US_ASSUMED_SHIPPING = 8.00   # search data hides the buyer's shipping cost;
@@ -199,6 +212,7 @@ TCGPLAYER_PRODUCT_LINES = [
     ("mtg",      "magic"),
     ("lorcana",  "disney lorcana"),
     ("onepiece", "one piece card game"),
+    ("yugioh",   "yugioh"),
 ]
 TCGPLAYER_PAGES_PER_GAME = 3         # × 50 newest sealed products per game
 TCGPLAYER_SCAN_INTERVAL  = 1800      # min seconds between sweeps
@@ -327,6 +341,10 @@ WEBHOOKS = {
     game: {tier: _slot(game, tier) for tier in ("premium", "budget", "sealed")}
     for game in ("pokemon", "mtg", "lorcana", "onepiece")
 }
+
+# Yu-Gi-Oh public traffic deliberately has ONE channel. It must never inherit
+# the three-tier matrix or the cross-game RESTOCK_WEBHOOK.
+YUGIOH_WEBHOOK = os.environ.get("YUGIOH_WEBHOOK", "")
 
 # Dedicated restock channel — a SINGLE webhook that receives every game's retail
 # restock alert. When set, restock pings go here instead of each game's #sealed
@@ -526,6 +544,8 @@ _GAME_PREFIXES = {
     "mtg":      ("magic the gathering", "mtg", "magic"),
     "lorcana":  ("disney lorcana", "lorcana tcg", "lorcana"),
     "onepiece": ("one piece card game", "one piece tcg", "one piece"),
+    "yugioh":   ("yu-gi-oh trading card game", "yu-gi-oh tcg", "yu-gi-oh",
+                  "yugioh tcg", "yugioh"),
 }
 
 
@@ -537,9 +557,18 @@ _GAME_PREFIXES = {
 # "pokemon_jp" is a pseudo-game used ONLY by the sealed-price index so Mercari JP
 # boxes are priced against the Japanese category (85) instead of the English one.
 TCGCSV_CATEGORY = {"pokemon": 3, "mtg": 1, "lorcana": 71, "onepiece": 68,
+                   "yugioh": 2,
                    "pokemon_jp": 85}
 TCGCSV_ONEPIECE_CAT   = TCGCSV_CATEGORY["onepiece"]
 _OP_CODE_RE           = re.compile(r"\b((?:OP|ST|EB|PRB)\d{2}-\d{3})\b", re.IGNORECASE)
+_YUGIOH_CODE_RE       = re.compile(
+    # Covers legacy LOB-001 / modern RA01-EN001 and Speed Duel SS04-ENA01
+    # forms. A regex hit is only a parser candidate; pricing still requires an
+    # exact code from the verified tcgcsv group plus exact card-name agreement.
+    r"\b([A-Z0-9]{2,8}-[A-Z]{0,3}\d{2,3})\b", re.IGNORECASE
+)
+_YUGIOH_INDEX_TTL     = 6 * 3600
+_YUGIOH_INDEX_RETRY   = 600
 _ONEPIECE_INDEX_TTL   = 6 * 3600   # rebuild the index at most every 6h on success
 _ONEPIECE_INDEX_RETRY = 600        # after a failed build, wait 10 min before retrying
 

@@ -52,6 +52,9 @@ from config import (
     _SINGLE_OVERRIDE,
     _SLAB_GRADE_RE,
     _SLAB_INDICATORS,
+    _YUGIOH_CODE_RE,
+    _YUGIOH_INDEX_RETRY,
+    _YUGIOH_INDEX_TTL,
     MIN_SELLER_FEEDBACK_PCT,
     MIN_SELLER_FEEDBACK_SCORE,
     POKEMON_TCG_URL,
@@ -179,6 +182,19 @@ def is_sealed(title: str) -> bool:
     if " display " in t and ("box" in t or "case" in t or "pack" in t):
         return True
     return False
+
+
+def is_yugioh_sealed(title: str) -> bool:
+    """Yu-Gi-Oh-only sealed forms not shared safely with the other games."""
+    if is_sealed(title):
+        return True
+    if is_graded_slab(title) or _YUGIOH_CODE_RE.search(title):
+        return False
+    t = f" {_ascii(title).casefold()} "
+    return any(kind in t for kind in (
+        " structure deck ", " starter deck ", " speed duel box ",
+        " mega tin ", " collector tin ", " sealed tin ",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +613,245 @@ def fetch_onepiece_price(code: str, title: str):
     return market_price, name
 
 
+# Yu-Gi-Oh singles are identified by their printed set code (LOB-001,
+# RA01-EN001, etc.), never by a generic card-name search. The code prefix is
+# matched to TCGplayer's live group abbreviation, so only that one group needs
+# two tcgcsv requests instead of downloading all ~650 groups.
+_ygo_groups: dict[str, list[dict]] = {}
+_ygo_groups_until = 0.0
+_ygo_group_indexes: dict[int, dict[str, list]] = {}
+_ygo_group_until: dict[int, float] = {}
+
+
+def _yugioh_groups() -> dict[str, list[dict]]:
+    global _ygo_groups, _ygo_groups_until
+    now = time.monotonic()
+    if now < _ygo_groups_until:
+        return _ygo_groups
+    base = f"https://tcgcsv.com/tcgplayer/{TCGCSV_CATEGORY['yugioh']}"
+    try:
+        categories = requests.get(
+            "https://tcgcsv.com/tcgplayer/categories",
+            headers=_HTTP_HEADERS, timeout=15,
+        ).json().get("results", [])
+        category = next(
+            (c for c in categories if c.get("categoryId") == TCGCSV_CATEGORY["yugioh"]),
+            None,
+        )
+        if not category or str(category.get("name", "")).casefold() != "yugioh":
+            print("  [WARN] tcgcsv category 2 did not verify as YuGiOh; pricing disabled")
+            _ygo_groups = {}
+            _ygo_groups_until = now + _YUGIOH_INDEX_RETRY
+            return {}
+        groups = requests.get(
+            f"{base}/groups", headers=_HTTP_HEADERS, timeout=15,
+        ).json().get("results", [])
+    except (requests.RequestException, ValueError) as exc:
+        print(f"  [WARN] tcgcsv Yu-Gi-Oh catalog verification failed: {type(exc).__name__}")
+        _ygo_groups = {}
+        _ygo_groups_until = now + _YUGIOH_INDEX_RETRY
+        return {}
+    verified: dict[str, list[dict]] = {}
+    for group in groups:
+        if group.get("groupId") is None or not group.get("abbreviation"):
+            continue
+        verified.setdefault(
+            str(group["abbreviation"]).upper(), []
+        ).append(group)
+    if verified:
+        _ygo_groups = verified
+        _ygo_groups_until = now + _YUGIOH_INDEX_TTL
+    else:
+        _ygo_groups = {}
+        _ygo_groups_until = now + _YUGIOH_INDEX_RETRY
+    return _ygo_groups
+
+
+def _build_yugioh_group(group: dict) -> dict[str, list]:
+    base = f"https://tcgcsv.com/tcgplayer/{TCGCSV_CATEGORY['yugioh']}"
+    _group, products, prices = _fetch_group(base, group)
+    by_product: dict = {}
+    for row in prices:
+        try:
+            market = float(row.get("marketPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        edition = str(row.get("subTypeName") or "").casefold()
+        if market > 0 and edition in {"1st edition", "unlimited"}:
+            by_product.setdefault(row.get("productId"), []).append((edition, market))
+    index: dict[str, list] = {}
+    for product in products:
+        code = next(
+            (str(e.get("value", "")).upper() for e in product.get("extendedData", [])
+             if e.get("name") == "Number"),
+            "",
+        )
+        if not _YUGIOH_CODE_RE.fullmatch(code):
+            continue
+        name = str(product.get("name") or "")
+        rarity = next(
+            (str(e.get("value") or "") for e in product.get("extendedData", [])
+             if e.get("name") == "Rarity"),
+            "",
+        )
+        for edition, market in by_product.get(product.get("productId"), []):
+            index.setdefault(code, []).append((name, rarity, edition, market))
+    return index
+
+
+def _yugioh_group_index(group: dict) -> dict[str, list]:
+    gid = int(group["groupId"])
+    now = time.monotonic()
+    if now < _ygo_group_until.get(gid, 0):
+        return _ygo_group_indexes.get(gid, {})
+    index = _build_yugioh_group(group)
+    if index:
+        _ygo_group_indexes[gid] = index
+        _ygo_group_until[gid] = now + _YUGIOH_INDEX_TTL
+    else:
+        _ygo_group_until[gid] = now + _YUGIOH_INDEX_RETRY
+    return _ygo_group_indexes.get(gid, {})
+
+
+def _normalized_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", _ascii(value).casefold()))
+
+
+_YGO_RARITY_PATTERNS = (
+    ("quarter century secret rare",
+     r"\b(?:quarter century(?: secret rare)?|qcsr|qcr)\b"),
+    ("platinum secret rare", r"\b(?:platinum secret rare|psr)\b"),
+    ("prismatic ultimate rare",
+     r"\b(?:prismatic ultimate rare|pur)\b"),
+    ("prismatic collector s rare",
+     r"\b(?:prismatic collector'?s rare|pcr)\b"),
+    ("starlight rare", r"\b(?:starlight rare|starlight)\b"),
+    ("ghost rare", r"\bghost rare\b"),
+    ("ultimate rare", r"\b(?:ultimate rare|utr)\b"),
+    ("collector s rare", r"\bcollector'?s rare\b"),
+    ("secret rare", r"\b(?:secret rare|scr)\b"),
+    ("ultra rare", r"\b(?:ultra rare|ur)\b"),
+    ("super rare", r"\b(?:super rare|sr)\b"),
+    ("rare", r"\brare\b"),
+    ("common", r"\bcommon\b"),
+)
+_YGO_RARITY_ALIASES = {
+    "quarter century rare": "quarter century secret rare",
+    "qcsr": "quarter century secret rare",
+    "qcr": "quarter century secret rare",
+    "psr": "platinum secret rare",
+    "pur": "prismatic ultimate rare",
+    "pcr": "prismatic collector s rare",
+    "starlight": "starlight rare",
+    "utr": "ultimate rare",
+    "scr": "secret rare",
+    "ur": "ultra rare",
+    "sr": "super rare",
+}
+
+
+def _yugioh_rarity(value: str) -> str:
+    normalized = _normalized_phrase(value)
+    return _YGO_RARITY_ALIASES.get(normalized, normalized)
+
+
+def _yugioh_title_rarities(title: str) -> set[str]:
+    """Canonical explicit rarity signals, with specific rarities taking precedence."""
+    found: set[str] = set()
+    occupied: list[tuple[int, int]] = []
+    for canonical, pattern in _YGO_RARITY_PATTERNS:
+        for match in re.finditer(pattern, title, re.I):
+            if any(match.start() >= start and match.end() <= end
+                   for start, end in occupied):
+                continue
+            found.add(canonical)
+            occupied.append(match.span())
+    return found
+
+
+def _yugioh_base_name(name: str, rarity: str) -> str:
+    """Remove TCGplayer's trailing rarity annotation, not card-name parentheses."""
+    match = re.search(r"\s+\(([^()]*)\)\s*$", name)
+    if match and _yugioh_rarity(match.group(1)) == _yugioh_rarity(rarity):
+        return name[:match.start()].strip()
+    return name
+
+
+def _select_yugioh_group(groups: list[dict], title: str) -> dict | None:
+    """Resolve duplicate set abbreviations only from explicit print-run qualifiers."""
+    if len(groups) == 1:
+        return groups[0]
+    normalized = f" {_normalized_phrase(title)} "
+    if " reprint " in normalized:
+        pool = [g for g in groups if "reprint" in str(g.get("name", "")).casefold()]
+        return pool[0] if len(pool) == 1 else None
+    if " original " in normalized:
+        pool = [g for g in groups if "reprint" not in str(g.get("name", "")).casefold()]
+        return pool[0] if len(pool) == 1 else None
+    title_years = set(re.findall(r"\b(?:19|20)\d{2}\b", title))
+    if title_years:
+        pool = []
+        for group in groups:
+            group_years = set(re.findall(
+                r"\b(?:19|20)\d{2}\b",
+                f"{group.get('name', '')} {group.get('publishedOn', '')}",
+            ))
+            if title_years & group_years:
+                pool.append(group)
+        return pool[0] if len(pool) == 1 else None
+    return None
+
+
+def fetch_yugioh_price(code: str, title: str):
+    """Return an exact Yu-Gi-Oh print price or None.
+
+    Set code, card name, and edition must all agree. If a catalog row has both
+    Unlimited and 1st Edition prices and the listing omits edition, fail closed.
+    """
+    prefix = code.split("-", 1)[0].upper()
+    groups = _yugioh_groups().get(prefix, [])
+    group = _select_yugioh_group(groups, title)
+    if not group:
+        return None
+    candidates = _yugioh_group_index(group).get(code.upper(), [])
+    if not candidates:
+        return None
+    normalized_title = f" {_normalized_phrase(title)} "
+    candidates = [
+        c for c in candidates
+        if f" {_normalized_phrase(_yugioh_base_name(c[0], c[1]))} "
+        in normalized_title
+    ]
+    if not candidates:
+        return None
+    first = bool(re.search(r"\b(?:1st|first)\s+edition\b", title, re.I))
+    unlimited = bool(re.search(r"\bunlimited\b", title, re.I))
+    if first == unlimited:  # neither or contradictory
+        editions = {c[2] for c in candidates}
+        if len(editions) != 1:
+            return None
+    else:
+        wanted = "1st edition" if first else "unlimited"
+        candidates = [c for c in candidates if c[2] == wanted]
+    explicit_rarities = _yugioh_title_rarities(title)
+    if len(explicit_rarities) > 1:
+        return None
+    if explicit_rarities:
+        wanted_rarity = next(iter(explicit_rarities))
+        candidates = [
+            c for c in candidates
+            if _yugioh_rarity(c[1]) == wanted_rarity
+        ]
+    elif len({_yugioh_rarity(c[1]) for c in candidates}) != 1:
+        return None
+    identities = {(c[0], c[1], c[2]) for c in candidates}
+    if len(identities) != 1:
+        return None
+    name, rarity, edition = next(iter(identities))
+    market = min(c[3] for c in candidates)
+    return market, f"{name} {code.upper()} ({rarity}, {edition.title()})"
+
+
 # ---------------------------------------------------------------------------
 # Japanese Pokémon singles pricing via tcgcsv (category 85 = "Pokemon Japan").
 #   English Pokémon are priced by pokemontcg.io above (English TCGplayer market).
@@ -909,6 +1164,9 @@ def parse_title(game: str, title: str):
     if game == "onepiece":
         m = _OP_CODE_RE.search(_ascii(title))
         return m.group(1).upper() if m else None       # "OP01-024"
+    if game == "yugioh":
+        m = _YUGIOH_CODE_RE.search(_ascii(title))
+        return m.group(1).upper() if m else None
     if game in ("mtg", "lorcana"):
         return _name_tokens(title, game) or None        # ["sol", "ring"]
     return None
@@ -930,4 +1188,6 @@ def fetch_price(game: str, parsed, title: str):
         return fetch_lorcana_price(parsed, title)
     if game == "onepiece":
         return fetch_onepiece_price(parsed, title)
+    if game == "yugioh":
+        return fetch_yugioh_price(parsed, title)
     return None

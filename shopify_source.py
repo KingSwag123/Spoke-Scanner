@@ -57,7 +57,7 @@ from config import (
     SHOPIFY_TIMEOUT,
     shopify_proxies,
 )
-from api_engines import detect_language, is_sealed
+from api_engines import detect_language, is_sealed, is_yugioh_sealed
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,7 @@ _GAME_TOKENS = (
     ("mtg",      ("magic: the gathering", "magic the gathering", " mtg ")),
     ("lorcana",  ("lorcana",)),
     ("onepiece", ("one piece", "one-piece")),
+    ("yugioh",   ("yu-gi-oh", "yugioh")),
 )
 
 
@@ -379,7 +380,9 @@ def detect_restocks(shopify_listings: list[dict], state: dict) -> list[dict]:
     for it in shopify_listings:
         if it.get("game_name") is None:
             continue
-        if not is_sealed(it["title"]):
+        if not (is_sealed(it["title"])
+                or (it.get("game_name") == "yugioh"
+                    and is_yugioh_sealed(it["title"]))):
             continue
         if it["price"] < MIN_PRICE_FLOOR:    # ignore cheap packs / singles
             continue
