@@ -589,7 +589,7 @@ def _search_tcgplayer(query: dict) -> dict:
             "shipping": round(total - lowest, 2),
             "total_price": total,
             "currency": "USD",
-            "url": f"https://www.tcgplayer.com/product/{product_id}",
+            "url": f"https://www.tcgplayer.com/product/{stable_product_id}",
             "condition": condition,
             "availability": "available",
             "source": "tcgplayer",

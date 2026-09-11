@@ -36,6 +36,15 @@ from watchlist_views import (
 )
 
 
+def _watch_listing_url(item: dict) -> str:
+    """Repair legacy queued TCGplayer URLs without changing other links."""
+    return re.sub(
+        r"^(https://www\.tcgplayer\.com/product/\d+)\.0+(?=[/?#]|$)",
+        r"\1",
+        str(item.get("url") or ""),
+    )
+
+
 _SUPPORTED_GAME_ALIASES = (
     "pokemon",
     "pokémon",
@@ -1677,7 +1686,7 @@ class WatchlistBot(commands.Bot):
                 item = entry.payload
                 total = self._total(item)
                 title = discord.utils.escape_markdown(str(item.get("title") or "Listing"))
-                url = str(item.get("url") or "")
+                url = _watch_listing_url(item)
                 marketplace = str(item.get("store") or item.get("source") or "Unknown")
                 embed = discord.Embed(
                     title=(
@@ -1758,10 +1767,11 @@ class WatchlistBot(commands.Bot):
         try:
             user = self.get_user(watch.user_id) or await self.fetch_user(watch.user_id)
             shipping = float(item.get("shipping", 0))
+            url = _watch_listing_url(item)
             embed = discord.Embed(
                 title="Scout report: I found a match!",
-                description=f"[{item['title']}]({item['url']})",
-                url=item["url"],
+                description=f"[{item['title']}]({url})",
+                url=url,
                 color=0xF1C40F,
             )
             embed.add_field(name="Total", value=f"${total:,.2f}", inline=True)

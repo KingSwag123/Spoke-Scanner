@@ -26,12 +26,22 @@ from watchlist_bot import (
     WatchlistStore,
     _listing_matches_watch_filters,
     _unsupported_game_name,
+    _watch_listing_url,
 )
 from watchlist_views import AllWatchRemovalConfirmationView, MultipleWatchRemovalView
 from watch_search import MERCARI_DAILY_PERSONAL_REQUEST_CAP, TargetedWatchSearch
 
 
 class WatchlistStoreTests(unittest.TestCase):
+    def test_legacy_queued_tcgplayer_links_are_repaired(self):
+        base = "https://www.tcgplayer.com/product/451833"
+        for suffix in ("", "?Language=English", "/lugia-v#listings"):
+            self.assertEqual(_watch_listing_url({"url": base + ".0" + suffix}),
+                             base + suffix)
+        for url in (base, "https://example.com/product/451833.0",
+                    "https://www.tcgplayer.com/product/451833.5"):
+            self.assertEqual(_watch_listing_url({"url": url}), url)
+
     def test_explicit_rarity_cannot_be_overridden_by_title(self):
         watch = Watch(1, 1, "Exodia", "exodia", 50, "yugioh", rarity="Rare")
         listing = {"game_name": "yugioh", "rarity": "Ultra Rare"}

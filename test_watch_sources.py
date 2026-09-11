@@ -110,7 +110,7 @@ class WatchSourceTests(unittest.TestCase):
         empty = watch_sources.search_watch_source("tcgplayer", {"item_name": "Black Lotus"})
         self.assertEqual(empty["status"], "ok")
         post.return_value = _Response({"results": [{"results": [{
-            "productId": 42, "productName": "Charizard ex",
+            "productId": 42.0, "productName": "Charizard ex",
             "lowestPrice": 90, "lowestPriceWithShipping": 94.5,
             "marketPrice": 110, "rarity": "Double Rare", "setName": "Obsidian Flames",
             "game": "YuGiOh",
@@ -122,6 +122,7 @@ class WatchSourceTests(unittest.TestCase):
         self.assertEqual(listing["game_name"], "yugioh")
         self.assertEqual(listing["listing_identity_type"], "product_offer_aggregate")
         self.assertEqual(listing["item_id"], "tcgplayer-product-offer-42-9450-live-marketplace-offer")
+        self.assertEqual(listing["url"], "https://www.tcgplayer.com/product/42")
         self.assertEqual(result["requests"], 1)
 
     def test_tcgplayer_quote_identity_changes_only_with_quote_or_condition(self):
