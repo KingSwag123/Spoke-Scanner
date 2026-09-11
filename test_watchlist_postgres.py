@@ -20,6 +20,7 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
         self.user_id = 800_000_000_000_000_000 + (
             uuid.uuid4().int % 10_000_000_000
         )
+        self.other_user_id = self.user_id + 1
         self.store = PostgresWatchlistStore()
 
     def tearDown(self):
@@ -29,16 +30,32 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
                 (self.user_id,),
             )
             conn.execute(
+                "DELETE FROM pending_watch_dms WHERE user_id = %s",
+                (self.other_user_id,),
+            )
+            conn.execute(
                 "DELETE FROM watchlist_deliveries WHERE user_id = %s",
                 (self.user_id,),
+            )
+            conn.execute(
+                "DELETE FROM watchlist_deliveries WHERE user_id = %s",
+                (self.other_user_id,),
             )
             conn.execute(
                 "DELETE FROM watchlists WHERE user_id = %s",
                 (self.user_id,),
             )
             conn.execute(
+                "DELETE FROM watchlists WHERE user_id = %s",
+                (self.other_user_id,),
+            )
+            conn.execute(
                 "DELETE FROM watchlist_dm_pacing WHERE user_id = %s",
                 (self.user_id,),
+            )
+            conn.execute(
+                "DELETE FROM watchlist_dm_pacing WHERE user_id = %s",
+                (self.other_user_id,),
             )
 
     @staticmethod
@@ -270,6 +287,58 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(row[1])
         self.assertEqual(self.store.claim_targeted_searches(), [])
+
+    def test_bulk_delete_isolated_cleans_work_and_invalidates_claim(self):
+        self.store.upsert_watch(self.user_id, "Pikachu V", 30)
+        self.store.upsert_watch(self.user_id, "Mew V", 30)
+        self.store.upsert_watch(self.other_user_id, "Pikachu V", 30)
+        own = self.store.list_watches_for_user(self.user_id)
+        selected = next(watch for watch in own if watch.item_name == "Pikachu V")
+        self.store.enqueue_matches([
+            self.listing(f"bulk-pikachu-{self.user_id}"),
+            {
+                "item_id": f"bulk-mew-{self.user_id}",
+                "title": "Persistent Mew V listing",
+                "price": 20,
+                "shipping": 2,
+                "url": "https://example.com/mew",
+            },
+        ])
+        initial_pending = self.store.pending(1000)
+        claimed = next(
+            entry for entry in initial_pending
+            if entry.user_id == self.user_id
+            and entry.item_id == f"bulk-pikachu-{self.user_id}"
+        )
+        self.store.mark_delivered(self.user_id, "bulk-history")
+        self.assertEqual(
+            self.store.delete_watches(self.user_id, [selected.id]),
+            ["Pikachu V"],
+        )
+        self.assertFalse(self.store.pending_is_current(claimed))
+        self.assertTrue(self.store.was_delivered(self.user_id, "bulk-history"))
+        self.assertTrue(any(
+            entry.user_id == self.other_user_id
+            and entry.item_id == f"bulk-pikachu-{self.user_id}"
+            for entry in initial_pending
+        ))
+        self.assertEqual(
+            [watch.item_name for watch in self.store.list_watches_for_user(self.user_id)],
+            ["Mew V"],
+        )
+        self.assertEqual(
+            [watch.item_name for watch in self.store.list_watches_for_user(
+                self.other_user_id
+            )],
+            ["Pikachu V"],
+        )
+        with psycopg.connect() as conn:
+            self.assertIsNone(conn.execute(
+                """
+                SELECT 1 FROM watch_targeted_search_jobs
+                WHERE user_id = %s AND normalized_name = 'pikachu v'
+                """, (self.user_id,),
+            ).fetchone())
 
     def test_imports_legacy_watches_deliveries_and_pending_alerts(self):
         delivered_id = f"delivered-{self.user_id}"

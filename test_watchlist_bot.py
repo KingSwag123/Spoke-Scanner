@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -26,6 +27,7 @@ from watchlist_bot import (
     _listing_matches_watch_filters,
     _unsupported_game_name,
 )
+from watchlist_views import AllWatchRemovalConfirmationView, MultipleWatchRemovalView
 from watch_search import MERCARI_DAILY_PERSONAL_REQUEST_CAP, TargetedWatchSearch
 
 
@@ -96,6 +98,58 @@ class WatchlistStoreTests(unittest.TestCase):
         self.assertEqual(self.store.pending_count(), 1)
         self.store.delete_watch(123, "Pikachu-V")
         self.assertEqual(self.store.pending_count(), 0)
+
+    def test_bulk_delete_isolated_cleans_work_and_invalidates_claim(self):
+        self.store.upsert_watch(123, "Pikachu V", 50)
+        self.store.upsert_watch(123, "Mew V", 50)
+        self.store.upsert_watch(456, "Pikachu V", 50)
+        own = self.store.list_watches_for_user(123)
+        self.store.enqueue_matches([
+            {
+                "item_id": "shared-pending",
+                "title": "Pikachu V",
+                "price": 20,
+                "shipping": 0,
+                "url": "https://example.com/shared",
+            },
+            {
+                "item_id": "mew-pending",
+                "title": "Mew V",
+                "price": 20,
+                "shipping": 0,
+                "url": "https://example.com/mew",
+            },
+        ])
+        initial_pending = self.store.pending(20)
+        claimed = next(
+            entry for entry in initial_pending
+            if entry.user_id == 123 and entry.item_id == "shared-pending"
+        )
+        selected = next(watch for watch in own if watch.item_name == "Pikachu V")
+        self.store.mark_delivered(123, "already-delivered")
+        deleted = self.store.delete_watches(123, [selected.id])
+
+        self.assertEqual(deleted, [selected.item_name])
+        self.assertFalse(self.store.pending_is_current(claimed))
+        self.assertTrue(self.store.was_delivered(123, "already-delivered"))
+        self.assertTrue(self.store.list_watches_for_user(456))
+        self.assertTrue(any(
+            entry.user_id == 456 and entry.item_id == "shared-pending"
+            for entry in initial_pending
+        ))
+        self.assertEqual(
+            [watch.item_name for watch in self.store.list_watches_for_user(123)],
+            [watch.item_name for watch in own if watch.id != selected.id],
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM watch_targeted_search_jobs "
+                    "WHERE user_id = ? AND normalized_name = ?",
+                    (123, selected.normalized_name),
+                ).fetchone()[0],
+                0,
+            )
 
     def test_catalog_filters_fail_closed_but_unfiltered_watches_still_work(self):
         self.store.upsert_watch(
@@ -344,10 +398,14 @@ class TargetedWatchSearchTests(unittest.TestCase):
             for index in range(MERCARI_DAILY_PERSONAL_REQUEST_CAP // 4):
                 # Simulate an elapsed short source window without advancing a
                 # day; every distinct query is still charged four requests.
-                scheduler._window_started = 0
+                scheduler._window_started = (
+                    time.monotonic() - scheduler.budget_window - 1
+                )
                 result = scheduler._one_source("mercari", {"item_name": f"Card {index}"})
                 self.assertEqual(result["status"], "ok")
-            scheduler._window_started = 0
+            scheduler._window_started = (
+                time.monotonic() - scheduler.budget_window - 1
+            )
             exhausted = scheduler._one_source("mercari", {"item_name": "One more"})
         self.assertEqual(exhausted["status"], "unavailable")
         self.assertIn("daily personal-search quota", exhausted["message"])
@@ -761,6 +819,146 @@ class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):
             [(entry.item_name, entry.max_price) for entry in self.bot.store.list_watches_for_user(987)],
             [("Mew V", 25.0)],
         )
+
+    async def test_unwatch_modes_open_owner_only_paginated_views(self):
+        for index in range(26):
+            self.bot.store.upsert_watch(123, f"Card {index:02d}", 20)
+        interaction = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(),
+                defer=AsyncMock(),
+            ),
+            edit_original_response=AsyncMock(),
+        )
+        command = self.bot.tree.get_command("unwatch")
+        await command.callback(interaction, None, "multiple")
+        view = interaction.response.send_message.await_args.kwargs["view"]
+        self.assertIsInstance(view, MultipleWatchRemovalView)
+        self.assertEqual(view.page_count, 2)
+        self.assertLessEqual(len(view.current_page_watches), 25)
+
+        chosen = view.current_page_watches[0]
+        await view._select_page(interaction, [str(chosen.id)])
+        await view._change_page(interaction, 1)
+        self.assertIn(chosen.id, view.selected_ids)
+        unauthorized = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=999),
+            response=types.SimpleNamespace(send_message=AsyncMock()),
+        )
+        self.assertFalse(await view.interaction_check(unauthorized))
+        unauthorized.response.send_message.assert_awaited_once()
+        self.assertIn(
+            chosen.id,
+            {watch.id for watch in self.bot.store.list_watches_for_user(123)},
+        )
+
+    async def test_unwatch_single_mode_remains_default(self):
+        interaction = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(send_message=AsyncMock()),
+        )
+        command = self.bot.tree.get_command("unwatch")
+        await command.callback(interaction, "Pikachu V")
+        self.assertEqual(self.bot.store.list_watches_for_user(123), [])
+        self.assertIn("off the hunt", interaction.response.send_message.await_args.args[0])
+
+    async def test_multiple_view_stale_id_cannot_remove_reused_watch(self):
+        watches = self.bot.store.list_watches_for_user(123)
+        view = MultipleWatchRemovalView(self.bot.store, 123, watches)
+        stale = watches[0]
+        view.selected_ids.add(stale.id)
+        self.bot.store.delete_watch(123, stale.item_name)
+        self.bot.store.upsert_watch(123, "Replacement watch", 20)
+        interaction = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(),
+                defer=AsyncMock(),
+            ),
+            edit_original_response=AsyncMock(),
+        )
+        await view._remove_selected(interaction)
+        self.assertEqual(
+            [watch.item_name for watch in self.bot.store.list_watches_for_user(123)],
+            ["Replacement watch"],
+        )
+
+    async def test_destructive_views_ack_before_db_and_guard_duplicate_clicks(self):
+        watches = self.bot.store.list_watches_for_user(123)
+        view = MultipleWatchRemovalView(self.bot.store, 123, watches)
+        view.selected_ids.add(watches[0].id)
+        first = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(
+                defer=AsyncMock(), send_message=AsyncMock()
+            ),
+            edit_original_response=AsyncMock(),
+        )
+        second = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(send_message=AsyncMock()),
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_to_thread(function, *args):
+            started.set()
+            await release.wait()
+            return function(*args)
+
+        with patch("watchlist_views.asyncio.to_thread", new=blocked_to_thread):
+            task = asyncio.create_task(view._remove_selected(first))
+            await started.wait()
+            await view._remove_selected(second)
+            second.response.send_message.assert_awaited_once()
+            release.set()
+            await task
+        first.response.defer.assert_awaited_once_with()
+        first.edit_original_response.assert_awaited_once()
+        self.assertEqual(self.bot.store.list_watches_for_user(123), [])
+
+        class FailingStore:
+            def delete_watches(self, *_args):
+                raise RuntimeError("database unavailable")
+
+        failing_view = MultipleWatchRemovalView(FailingStore(), 123, watches)
+        failing_view.selected_ids.add(watches[0].id)
+        failed = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(
+                defer=AsyncMock(), send_message=AsyncMock()
+            ),
+            edit_original_response=AsyncMock(),
+        )
+        await failing_view._remove_selected(failed)
+        self.assertFalse(failing_view._busy)
+        self.assertFalse(failing_view._closed)
+        failed.response.defer.assert_awaited_once_with()
+        failed.edit_original_response.assert_awaited_once()
+
+    async def test_unwatch_all_confirmation_cancel_and_confirm(self):
+        interaction = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=123),
+            response=types.SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(),
+                defer=AsyncMock(),
+            ),
+            edit_original_response=AsyncMock(),
+        )
+        command = self.bot.tree.get_command("unwatch")
+        await command.callback(interaction, None, "all")
+        view = interaction.response.send_message.await_args.kwargs["view"]
+        self.assertIsInstance(view, AllWatchRemovalConfirmationView)
+        await view._cancel(interaction)
+        self.assertEqual(len(self.bot.store.list_watches_for_user(123)), 1)
+
+        await command.callback(interaction, None, "all")
+        view = interaction.response.send_message.await_args.kwargs["view"]
+        await view._confirm(interaction)
+        self.assertEqual(self.bot.store.list_watches_for_user(123), [])
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
 
     async def test_initial_all_source_failures_do_not_claim_a_zero_match(self):
         watch = self.bot.store.list_watches_for_user(123)[0]

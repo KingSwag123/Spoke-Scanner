@@ -161,28 +161,140 @@ class PostgresWatchlistStore:
             ).fetchall()
         return self._to_watches(rows)
 
+    def delete_watches(
+        self, user_id: int, watch_ids: Iterable[int],
+        expected_normalized: dict[int, str] | None = None,
+    ) -> list[str]:
+        """Atomically remove selected IDs owned by one user.
+
+        The ownership predicate is repeated on every mutation.  In particular,
+        a component payload containing another user's watch ID can never remove
+        that row or any of its queued work.
+        """
+        ids: list[int] = []
+        for watch_id in watch_ids:
+            try:
+                value = int(watch_id)
+            except (TypeError, ValueError):
+                continue
+            if value not in ids:
+                ids.append(value)
+        if not ids:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, item_name, normalized_name
+                FROM watchlists
+                WHERE user_id = %s AND id = ANY(%s::bigint[])
+                ORDER BY normalized_name
+                FOR UPDATE
+                """,
+                (user_id, ids),
+            ).fetchall()
+            if expected_normalized is not None:
+                rows = [
+                    row for row in rows
+                    if expected_normalized.get(int(row["id"]))
+                    == row["normalized_name"]
+                ]
+            if not rows:
+                return []
+            row_ids = [row["id"] for row in rows]
+            normalized_names = [row["normalized_name"] for row in rows]
+            conn.execute(
+                """
+                DELETE FROM pending_watch_dms
+                WHERE user_id = %s AND normalized_name = ANY(%s::text[])
+                """,
+                (user_id, normalized_names),
+            )
+            conn.execute(
+                """
+                DELETE FROM watch_targeted_search_jobs
+                WHERE user_id = %s AND normalized_name = ANY(%s::text[])
+                """,
+                (user_id, normalized_names),
+            )
+            conn.execute(
+                """
+                DELETE FROM watchlists
+                WHERE user_id = %s AND id = ANY(%s::bigint[])
+                """,
+                (user_id, row_ids),
+            )
+        return [str(row["item_name"]) for row in rows]
+
+    def delete_all_watches(self, user_id: int) -> list[str]:
+        """Atomically remove every current watch for one user."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, item_name, normalized_name
+                FROM watchlists
+                WHERE user_id = %s
+                ORDER BY normalized_name
+                FOR UPDATE
+                """,
+                (user_id,),
+            ).fetchall()
+            if not rows:
+                return []
+            normalized_names = [row["normalized_name"] for row in rows]
+            conn.execute(
+                """
+                DELETE FROM pending_watch_dms
+                WHERE user_id = %s AND normalized_name = ANY(%s::text[])
+                """,
+                (user_id, normalized_names),
+            )
+            conn.execute(
+                """
+                DELETE FROM watch_targeted_search_jobs
+                WHERE user_id = %s AND normalized_name = ANY(%s::text[])
+                """,
+                (user_id, normalized_names),
+            )
+            conn.execute(
+                "DELETE FROM watchlists WHERE user_id = %s AND id = ANY(%s::bigint[])",
+                (user_id, [row["id"] for row in rows]),
+            )
+        return [str(row["item_name"]) for row in rows]
+
     def delete_watch(self, user_id: int, item_name: str) -> str | None:
         normalized = _normalize_term(item_name)
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                DELETE FROM watchlists
+                SELECT id, item_name, normalized_name
+                FROM watchlists
                 WHERE user_id = %s AND normalized_name = %s
-                RETURNING item_name
+                ORDER BY id
+                FOR UPDATE
                 """,
                 (user_id, normalized),
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            if not rows:
                 return None
+            row = rows[0]
+            normalized_names = [row["normalized_name"]]
             conn.execute(
-                "DELETE FROM pending_watch_dms "
-                "WHERE user_id = %s AND normalized_name = %s",
-                (user_id, normalized),
+                """
+                DELETE FROM pending_watch_dms
+                WHERE user_id = %s AND normalized_name = ANY(%s::text[])
+                """,
+                (user_id, normalized_names),
             )
             conn.execute(
-                "DELETE FROM watch_targeted_search_jobs "
-                "WHERE user_id = %s AND normalized_name = %s",
-                (user_id, normalized),
+                """
+                DELETE FROM watch_targeted_search_jobs
+                WHERE user_id = %s AND normalized_name = ANY(%s::text[])
+                """,
+                (user_id, normalized_names),
+            )
+            conn.execute(
+                "DELETE FROM watchlists WHERE user_id = %s AND id = %s",
+                (user_id, row["id"]),
             )
         return str(row["item_name"])
 

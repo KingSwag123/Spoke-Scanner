@@ -27,6 +27,10 @@ from tcgcsv_catalog import (
     rarity_matches_title,
 )
 from watch_search import SOURCES, TargetedWatchSearch
+from watchlist_views import (
+    AllWatchRemovalConfirmationView,
+    MultipleWatchRemovalView,
+)
 
 
 _SUPPORTED_GAME_ALIASES = (
@@ -513,43 +517,132 @@ class WatchlistStore:
             ).fetchall()
         return [Watch(**dict(row)) for row in rows]
 
+    @staticmethod
+    def _delete_watch_rows(
+        conn: sqlite3.Connection,
+        user_id: int,
+        rows: Iterable[sqlite3.Row],
+    ) -> list[str]:
+        """Delete selected rows and their undelivered work in one transaction.
+
+        The watch IDs are resolved before any delete and every subsequent
+        statement remains scoped by the owning user.  SQLite's pending table
+        predates its normalized-name column, so its canonical persisted
+        ``item_name`` is used as a relational link while the selected watch
+        IDs remain the source of truth.
+        """
+        selected = list(rows)
+        if not selected:
+            return []
+        watch_ids = [int(row["id"]) for row in selected]
+        names = [str(row["item_name"]) for row in selected]
+        normalized_names = [str(row["normalized_name"]) for row in selected]
+
+        # Do not send alerts that were matched but not yet delivered before
+        # these watches were removed. Delivery history intentionally remains.
+        # Keep each statement below under SQLite's variable limit so a very
+        # large /all operation remains one atomic transaction.
+        for offset in range(0, len(names), 400):
+            names_chunk = names[offset:offset + 400]
+            name_placeholders = ",".join("?" for _ in names_chunk)
+            conn.execute(
+                f"DELETE FROM pending_watch_dms "
+                f"WHERE user_id = ? AND item_name IN ({name_placeholders})",
+                (user_id, *names_chunk),
+            )
+        for offset in range(0, len(normalized_names), 400):
+            normalized_chunk = normalized_names[offset:offset + 400]
+            normalized_placeholders = ",".join("?" for _ in normalized_chunk)
+            conn.execute(
+                f"DELETE FROM watch_targeted_search_jobs "
+                f"WHERE user_id = ? AND normalized_name IN "
+                f"({normalized_placeholders})",
+                (user_id, *normalized_chunk),
+            )
+        for offset in range(0, len(watch_ids), 400):
+            ids_chunk = watch_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in ids_chunk)
+            conn.execute(
+                f"DELETE FROM watchlists WHERE user_id = ? AND id IN "
+                f"({placeholders})",
+                (user_id, *ids_chunk),
+            )
+        return names
+
+    def delete_watches(
+        self, user_id: int, watch_ids: Iterable[int],
+        expected_normalized: dict[int, str] | None = None,
+    ) -> list[str]:
+        """Atomically remove selected IDs owned by ``user_id``.
+
+        ``expected_normalized`` is optional UI-staleness protection: when
+        supplied, a row whose ID was deleted and reused for another watch is
+        ignored rather than accidentally removing the replacement.
+        """
+        ids: list[int] = []
+        for watch_id in watch_ids:
+            try:
+                value = int(watch_id)
+            except (TypeError, ValueError):
+                continue
+            if value not in ids:
+                ids.append(value)
+        if not ids:
+            return []
+        with self._connect() as conn:
+            # Lock writers before resolving IDs so a concurrent delete/reinsert
+            # cannot make a selected ID refer to a different watch.
+            conn.execute("BEGIN IMMEDIATE")
+            rows = []
+            for offset in range(0, len(ids), 400):
+                ids_chunk = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in ids_chunk)
+                rows.extend(conn.execute(
+                    f"""
+                    SELECT id, item_name, normalized_name
+                    FROM watchlists
+                    WHERE user_id = ? AND id IN ({placeholders})
+                    """,
+                    (user_id, *ids_chunk),
+                ).fetchall())
+            rows.sort(key=lambda row: row["normalized_name"])
+            if expected_normalized is not None:
+                rows = [
+                    row for row in rows
+                    if expected_normalized.get(int(row["id"]))
+                    == row["normalized_name"]
+                ]
+            return self._delete_watch_rows(conn, user_id, rows)
+
+    def delete_all_watches(self, user_id: int) -> list[str]:
+        """Atomically remove every current watch for one user."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, item_name, normalized_name
+                FROM watchlists
+                WHERE user_id = ?
+                ORDER BY normalized_name
+                """,
+                (user_id,),
+            ).fetchall()
+            return self._delete_watch_rows(conn, user_id, rows)
+
     def delete_watch(self, user_id: int, item_name: str) -> str | None:
         normalized = _normalize_term(item_name)
         with self._connect() as conn:
-            row = conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
                 """
-                SELECT item_name
+                SELECT id, item_name, normalized_name
                 FROM watchlists
                 WHERE user_id = ? AND normalized_name = ?
                 """,
                 (user_id, normalized),
-            ).fetchone()
-            if row is None:
-                return None
-            conn.execute(
-                "DELETE FROM watchlists "
-                "WHERE user_id = ? AND normalized_name = ?",
-                (user_id, normalized),
-            )
-            conn.execute(
-                "DELETE FROM watch_targeted_search_jobs "
-                "WHERE user_id = ? AND normalized_name = ?",
-                (user_id, normalized),
-            )
-            # Do not send alerts that were matched but not yet delivered before
-            # the user stopped this watch.
-            pending = conn.execute(
-                "SELECT item_id, item_name FROM pending_watch_dms WHERE user_id = ?",
-                (user_id,),
             ).fetchall()
-            for alert in pending:
-                if _normalize_term(alert["item_name"]) == normalized:
-                    conn.execute(
-                        "DELETE FROM pending_watch_dms "
-                        "WHERE user_id = ? AND item_id = ?",
-                        (user_id, alert["item_id"]),
-                    )
-        return str(row["item_name"])
+            deleted = self._delete_watch_rows(conn, user_id, rows[:1])
+        return deleted[0] if deleted else None
 
     def was_delivered(self, user_id: int, item_id: str) -> bool:
         with self._connect() as conn:
@@ -1168,16 +1261,84 @@ class WatchlistBot(commands.Bot):
             name="unwatch",
             description="Call your card-shop scout off the hunt for an item.",
         )
-        @app_commands.describe(item_name="Item name from your active watches")
+        @app_commands.describe(
+            item_name="Item name from your active watches (single mode only)",
+            mode="Remove one watch, choose several, or clear all watches",
+        )
+        @app_commands.choices(mode=[
+            app_commands.Choice(name="Single", value="single"),
+            app_commands.Choice(name="Multiple", value="multiple"),
+            app_commands.Choice(name="All", value="all"),
+        ])
         async def unwatch(
             interaction: discord.Interaction,
-            item_name: app_commands.Range[str, 2, 100],
+            item_name: app_commands.Range[str, 2, 100] | None = None,
+            mode: str = "single",
         ) -> None:
+            raw_mode = getattr(mode, "value", mode)
+            # Keep direct callback callers that naturally put the new mode
+            # before the optional item name harmless, while the registered
+            # slash command retains the old item_name-first argument order.
+            if raw_mode is None and item_name in {"multiple", "all", "single"}:
+                raw_mode, item_name = item_name, None
+            mode = raw_mode or "single"
+            if mode not in {"single", "multiple", "all"}:
+                await interaction.response.send_message(
+                    "Choose Single, Multiple, or All for the removal mode.",
+                    ephemeral=True,
+                )
+                return
+            if mode == "single" and not item_name:
+                await interaction.response.send_message(
+                    "Single mode needs the item name to stop watching.",
+                    ephemeral=True,
+                )
+                return
+            if mode == "single" and len(_normalize_term(str(item_name))) < 2:
+                await interaction.response.send_message(
+                    "Give me at least two visible characters for the item name.",
+                    ephemeral=True,
+                )
+                return
+
+            if mode in {"multiple", "all"}:
+                try:
+                    watches = await asyncio.to_thread(
+                        self.store.list_watches_for_user,
+                        interaction.user.id,
+                    )
+                except (sqlite3.Error, psycopg.Error):
+                    print("[WATCHLIST][ERROR] Could not load /unwatch entries")
+                    await interaction.response.send_message(
+                        "I couldn't open your scouting list right now. "
+                        "Please try again in a moment.",
+                        ephemeral=True,
+                    )
+                    return
+                if not watches:
+                    await interaction.response.send_message(
+                        "Your scouting list is already empty.",
+                        ephemeral=True,
+                    )
+                    return
+                if mode == "multiple":
+                    view = MultipleWatchRemovalView(
+                        self.store, interaction.user.id, watches
+                    )
+                else:
+                    view = AllWatchRemovalConfirmationView(
+                        self.store, interaction.user.id, len(watches)
+                    )
+                await interaction.response.send_message(
+                    view.content(), view=view, ephemeral=True
+                )
+                return
+
             try:
                 deleted_name = await asyncio.to_thread(
                     self.store.delete_watch,
                     interaction.user.id,
-                    item_name,
+                    str(item_name),
                 )
             except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not delete /unwatch entry")
