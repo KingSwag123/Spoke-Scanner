@@ -21,6 +21,10 @@ CATALOG_RETRY_TTL = 120
 CATALOG_BUILD_BUDGET = 12.0
 CATALOG_WORKERS = 4
 CATALOG_BATCH_SIZE = 32
+# Discord requires an autocomplete response in roughly three seconds.  Leave
+# margin for scheduling/serialization around this synchronous catalog budget.
+CATALOG_AUTOCOMPLETE_BUDGET = 1.8
+CATALOG_LOADING_VALUE = "__tcgcsv_catalog_loading__"
 
 GAMES = ("pokemon", "mtg", "lorcana", "onepiece", "yugioh")
 GAME_LABELS = {
@@ -147,6 +151,19 @@ class CatalogSnapshot:
     complete: bool
 
 
+@dataclass(frozen=True)
+class CatalogSetLookup:
+    """A card-verified lookup for the text currently in the set field.
+
+    ``pending`` deliberately means "not proven either way", including a
+    temporary upstream failure.  Callers must not translate it into a
+    card-missing result.
+    """
+
+    sets: tuple[CatalogSet, ...]
+    pending: bool
+
+
 class TCGCSVWatchCatalog:
     """Thread-safe, in-process cache for autocomplete and server validation."""
 
@@ -160,10 +177,287 @@ class TCGCSVWatchCatalog:
         self._failed_until: dict[str, dict[int, float]] = {}
         self._next_batch_at: dict[str, float] = {}
         self._building: set[str] = set()
+        self._groups_building: set[str] = set()
+        self._products_building: dict[str, set[int]] = {}
         self._lock = threading.Lock()
         # A no-game autocomplete may warm all supported games. Limit aggregate
         # TCGCSV traffic as well as each game's own worker pool.
         self._network_slots = threading.BoundedSemaphore(2)
+
+    def _load_groups_until(
+        self, game: str, deadline: float
+    ) -> tuple[dict, ...] | None:
+        """Fetch one game's group index once, respecting a shared deadline."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._groups.get(game, ())
+            if game in self._groups and now < self._groups_until.get(game, 0):
+                return cached
+            if game in self._groups_building:
+                return None
+            self._groups_building.add(game)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._network_slots.acquire(
+                timeout=max(0, remaining)
+            ):
+                return None
+            try:
+                response = requests.get(
+                    f"https://tcgcsv.com/tcgplayer/{TCGCSV_CATEGORY[game]}/groups",
+                    headers=_HTTP_HEADERS,
+                    timeout=max(0.05, min(4.0, deadline - time.monotonic())),
+                )
+                response.raise_for_status()
+                groups = response.json().get("results", [])
+            except (requests.RequestException, ValueError, AttributeError):
+                return None
+            finally:
+                self._network_slots.release()
+            valid_groups = tuple(
+                group for group in groups
+                if group.get("groupId") is not None
+                and str(group.get("name") or "").strip()
+            )
+            with self._lock:
+                allowed = {int(group["groupId"]) for group in valid_groups}
+                self._products[game] = {
+                    group_id: products
+                    for group_id, products in self._products.get(game, {}).items()
+                    if group_id in allowed
+                }
+                self._products_until[game] = {
+                    group_id: expiry
+                    for group_id, expiry in self._products_until.get(game, {}).items()
+                    if group_id in allowed
+                }
+                self._failed_until[game] = {
+                    group_id: retry
+                    for group_id, retry in self._failed_until.get(game, {}).items()
+                    if group_id in allowed
+                }
+                self._groups[game] = valid_groups
+                self._groups_until[game] = time.monotonic() + CATALOG_TTL
+            return valid_groups
+        finally:
+            with self._lock:
+                self._groups_building.discard(game)
+
+    def _store_targeted_products(
+        self,
+        game: str,
+        groups: tuple[dict, ...],
+        results: list[tuple[dict, list[CatalogProduct] | None]],
+        unfinished: tuple[dict, ...],
+    ) -> None:
+        """Persist targeted product rows and make them usable before full scans."""
+        now = time.monotonic()
+        with self._lock:
+            saved = self._products.setdefault(game, {})
+            expiries = self._products_until.setdefault(game, {})
+            failures = self._failed_until.setdefault(game, {})
+            building = self._products_building.setdefault(game, set())
+            for group, products in results:
+                group_id = int(group["groupId"])
+                building.discard(group_id)
+                if products is None:
+                    failures[group_id] = now + CATALOG_RETRY_TTL
+                else:
+                    saved[group_id] = tuple(products)
+                    expiries[group_id] = now + CATALOG_TTL
+                    failures.pop(group_id, None)
+            for group in unfinished:
+                # A deadline is not a verified empty group. Back it off so
+                # rapid Discord keystrokes cannot create a download storm.
+                group_id = int(group["groupId"])
+                building.discard(group_id)
+                failures[group_id] = now + CATALOG_RETRY_TTL
+            snapshot = self._snapshot_from_products(
+                game, groups, dict(saved), dict(expiries)
+            )
+            if snapshot.sets:
+                self._snapshots[game] = snapshot
+                self._until[game] = now + CATALOG_TTL
+                self._next_batch_at[game] = (
+                    float("inf") if snapshot.complete else now
+                )
+
+    def matching_sets_for_typed_set(
+        self,
+        card_name: str,
+        set_name: str,
+        game: str | None = None,
+        budget: float = CATALOG_AUTOCOMPLETE_BUDGET,
+    ) -> CatalogSetLookup:
+        """Find a typed set without scanning arbitrary product groups.
+
+        Group indexes are fetched in parallel when no game was selected, then
+        only groups whose names contain the typed set phrase have their products
+        downloaded.  A product still has to contain the exact card phrase before
+        it becomes an autocomplete selection.
+        """
+        card_phrase = normalize_catalog_text(card_name)
+        set_phrase = normalize_catalog_text(set_name)
+        games = (game,) if game in GAMES else GAMES
+        if len(card_phrase) < 2 or len(set_phrase) < 2:
+            return CatalogSetLookup((), False)
+        deadline = time.monotonic() + max(0.01, budget)
+
+        group_rows: dict[str, tuple[dict, ...] | None] = {}
+        # A selected game makes one request. With no game, only inexpensive group
+        # indexes are concurrent; product downloads remain limited below.
+        workers = min(len(games), CATALOG_WORKERS)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        futures: dict[concurrent.futures.Future, str] = {}
+        try:
+            futures = {
+                pool.submit(self._load_groups_until, candidate, deadline): candidate
+                for candidate in games
+            }
+            try:
+                for future in concurrent.futures.as_completed(
+                    futures, timeout=max(0.01, deadline - time.monotonic())
+                ):
+                    group_rows[futures[future]] = future.result()
+            except concurrent.futures.TimeoutError:
+                pass
+            finally:
+                for future in futures:
+                    future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            # A worker failure is still not evidence that the card/set pair is
+            # absent. Let the caller show its retry sentinel.
+            group_rows = {}
+        for future, candidate in futures.items():
+            if candidate not in group_rows and future.done() and not future.cancelled():
+                try:
+                    group_rows[candidate] = future.result()
+                except Exception:
+                    group_rows[candidate] = None
+
+        candidates: list[tuple[str, dict]] = []
+        pending = any(groups is None for groups in group_rows.values())
+        # Futures that could not start before this call's deadline are unknown,
+        # not proof that the game lacks a matching set.
+        pending = pending or len(group_rows) != len(games)
+        for candidate_game, groups in group_rows.items():
+            if groups is None:
+                continue
+            candidates.extend(
+                (candidate_game, group) for group in groups
+                if contains_catalog_phrase(str(group.get("name") or ""), set_phrase)
+            )
+
+        fetches: list[tuple[str, dict]] = []
+        with self._lock:
+            now = time.monotonic()
+            for candidate_game, group in candidates:
+                group_id = int(group["groupId"])
+                products = self._products.get(candidate_game, {}).get(group_id)
+                expiry = self._products_until.get(candidate_game, {}).get(group_id, 0)
+                if products is not None and now < expiry:
+                    continue
+                if group_id in self._products_building.get(candidate_game, set()):
+                    pending = True
+                elif now < self._failed_until.get(candidate_game, {}).get(group_id, 0):
+                    # Failure/backoff cannot be advertised as a negative lookup.
+                    pending = True
+                else:
+                    self._products_building.setdefault(candidate_game, set()).add(group_id)
+                    fetches.append((candidate_game, group))
+
+        results_by_game: dict[str, list[tuple[dict, list[CatalogProduct] | None]]] = {
+            candidate: [] for candidate in games
+        }
+        unfinished_by_game: dict[str, list[dict]] = {
+            candidate: [] for candidate in games
+        }
+        if fetches and time.monotonic() < deadline:
+            def fetch_target(candidate_game: str, group: dict):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._network_slots.acquire(
+                    timeout=max(0, remaining)
+                ):
+                    return candidate_game, (group, None)
+                try:
+                    base = (
+                        f"https://tcgcsv.com/tcgplayer/"
+                        f"{TCGCSV_CATEGORY[candidate_game]}"
+                    )
+                    return candidate_game, self._fetch_products(
+                        base, group, candidate_game,
+                        timeout=max(0.05, min(4.0, deadline - time.monotonic())),
+                    )
+                finally:
+                    self._network_slots.release()
+
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(CATALOG_WORKERS, len(fetches))
+            )
+            futures: dict[concurrent.futures.Future, tuple[str, dict]] = {}
+            try:
+                futures = {
+                    pool.submit(fetch_target, candidate_game, group): (candidate_game, group)
+                    for candidate_game, group in fetches
+                }
+                completed: set[tuple[str, int]] = set()
+                try:
+                    for future in concurrent.futures.as_completed(
+                        futures, timeout=max(0.01, deadline - time.monotonic())
+                    ):
+                        candidate_game, result = future.result()
+                        results_by_game[candidate_game].append(result)
+                        completed.add((candidate_game, int(result[0]["groupId"])))
+                except concurrent.futures.TimeoutError:
+                    pending = True
+                finally:
+                    for future in futures:
+                        future.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                for candidate_game, group in fetches:
+                    if (candidate_game, int(group["groupId"])) not in completed:
+                        unfinished_by_game[candidate_game].append(group)
+                        pending = True
+            except Exception:
+                pending = True
+                for candidate_game, group in fetches:
+                    unfinished_by_game[candidate_game].append(group)
+        elif fetches:
+            pending = True
+            for candidate_game, group in fetches:
+                unfinished_by_game[candidate_game].append(group)
+
+        for candidate_game, groups in group_rows.items():
+            if groups is not None:
+                self._store_targeted_products(
+                    candidate_game, groups, results_by_game[candidate_game],
+                    tuple(unfinished_by_game[candidate_game]),
+                )
+
+        matches: list[CatalogSet] = []
+        with self._lock:
+            for candidate_game, group in candidates:
+                group_id = int(group["groupId"])
+                products = self._products.get(candidate_game, {}).get(group_id)
+                if products is None or time.monotonic() >= self._products_until.get(
+                    candidate_game, {}
+                ).get(group_id, 0):
+                    pending = True
+                    continue
+                if any(contains_catalog_phrase(product.name, card_phrase)
+                       for product in products):
+                    snapshot = self._snapshots.get(candidate_game)
+                    card_set = next((
+                        entry for entry in (snapshot.sets if snapshot else ())
+                        if entry.group_id == group_id
+                    ), None)
+                    if card_set:
+                        matches.append(card_set)
+        return CatalogSetLookup(
+            tuple(sorted(matches, key=lambda item: (GAME_LABELS[item.game], item.name))),
+            pending,
+        )
 
     def is_ready(self, game: str) -> bool:
         with self._lock:
@@ -400,13 +694,13 @@ class TCGCSVWatchCatalog:
 
     @staticmethod
     def _fetch_products(
-        base: str, group: dict, game: str
+        base: str, group: dict, game: str, timeout: float = 4
     ) -> tuple[dict, list[CatalogProduct] | None]:
         try:
             response = requests.get(
                 f"{base}/{group['groupId']}/products",
                 headers=_HTTP_HEADERS,
-                timeout=4,
+                timeout=timeout,
             )
             response.raise_for_status()
             raw_products = response.json().get("results", [])
@@ -510,6 +804,11 @@ class TCGCSVWatchCatalog:
         """
         if game is not None and game not in GAMES:
             return None, None, "Choose a game from the provided list."
+        if set_token == CATALOG_LOADING_VALUE:
+            return None, None, (
+                "That set is still loading. Please retry set autocomplete shortly "
+                "and choose a catalog result before saving your watch."
+            )
         if rarity and not set_token:
             return None, None, "Choose a set before choosing a rarity."
         if not set_token:

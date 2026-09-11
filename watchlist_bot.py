@@ -21,6 +21,9 @@ from discord.ext import commands
 
 from sold_comps import format_sold_comps, get_sold_comps
 from tcgcsv_catalog import (
+    CATALOG_AUTOCOMPLETE_BUDGET,
+    CATALOG_BUILD_BUDGET,
+    CATALOG_LOADING_VALUE,
     GAME_LABELS,
     GAMES,
     TCGCSVWatchCatalog,
@@ -1077,7 +1080,7 @@ class WatchlistBot(commands.Bot):
         self._ready = threading.Event()
         self._last_health_warning = 0.0
         self._enrichment_tasks: set[asyncio.Task] = set()
-        self._catalog_tasks: dict[str, asyncio.Task] = {}
+        self._catalog_tasks: dict[object, asyncio.Task] = {}
         self.search_scheduler = TargetedWatchSearch(budget_store=self.store)
         self._target_scan_cursor = 0
         self._register_commands()
@@ -1202,31 +1205,47 @@ class WatchlistBot(commands.Bot):
             game = getattr(game, "value", game)
             if game not in GAMES:
                 game = None
-            if len(_normalize_term(card_name)) < 2:
+            if (len(_normalize_term(card_name)) < 2
+                    or len(_normalize_term(current)) < 2):
                 return []
-            if ((game and self.catalog.needs_refresh(game))
-                    or (not game and any(
-                        self.catalog.needs_refresh(candidate)
-                        for candidate in GAMES
-                    ))):
-                self._start_catalog_load(game)
-            matching_sets = self.catalog.matching_sets(card_name, game)
-            if matching_sets is None:
-                self._start_catalog_load(game)
-                # Discord autocomplete cannot display a durable status message.
-                # Submit validation explicitly tells the user to retry instead of
-                # accepting a guessed set while this background read is cold.
-                return []
-            needle = _normalize_term(current)
-            return [
+            # Do the smallest useful catalog read in the autocomplete callback:
+            # matching group names first, then only those groups' products. A
+            # full category scan cannot fit reliably inside Discord's deadline.
+            try:
+                lookup = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.catalog.matching_sets_for_typed_set,
+                        card_name,
+                        current,
+                        game,
+                        CATALOG_AUTOCOMPLETE_BUDGET,
+                    ),
+                    timeout=2.2,
+                )
+            except Exception:
+                self._start_catalog_set_load(card_name, current, game)
+                return [app_commands.Choice(
+                    name="Matching sets are loading — retry shortly",
+                    value=CATALOG_LOADING_VALUE,
+                )]
+            if lookup.pending:
+                self._start_catalog_set_load(card_name, current, game)
+            choices = [
                 app_commands.Choice(
                     name=(f"{GAME_LABELS[entry.game]}: {entry.name}"
                           + (f" [{entry.abbreviation}]" if entry.abbreviation else ""))[:100],
                     value=entry.token,
                 )
-                for entry in matching_sets
-                if not needle or needle in _normalize_term(entry.name)
-            ][:25]
+                for entry in lookup.sets
+            ][:24 if lookup.pending else 25]
+            if lookup.pending:
+                # This is intentionally an invalid opaque value. It gives a
+                # visible progress state without ever accepting a guessed set.
+                choices.append(app_commands.Choice(
+                    name="More matching sets are loading — retry shortly",
+                    value=CATALOG_LOADING_VALUE,
+                ))
+            return choices
 
         async def rarity_autocomplete(
             interaction: discord.Interaction, current: str
@@ -1239,13 +1258,8 @@ class WatchlistBot(commands.Bot):
                 selected_game = str(set_token).split(":", 1)[0]
             except (AttributeError, IndexError):
                 selected_game = None
-            if selected_game in GAMES and self.catalog.needs_refresh(selected_game):
-                self._start_catalog_load(selected_game)
             rarities = self.catalog.rarities(card_name, set_token)
             if rarities is None:
-                self._start_catalog_load(
-                    selected_game if selected_game in GAMES else None
-                )
                 return []
             needle = _normalize_term(current)
             return [
@@ -1419,6 +1433,33 @@ class WatchlistBot(commands.Bot):
                 asyncio.to_thread(self.catalog.ensure_game, candidate)
             )
             self._catalog_tasks[candidate] = task
+
+    def _start_catalog_set_load(
+        self, card_name: str, set_name: str, game: str | None
+    ) -> None:
+        """Continue one typed set lookup outside Discord's callback budget."""
+        normalized_game = game if game in GAMES else None
+        key = (
+            "typed-set", _normalize_term(card_name), _normalize_term(set_name),
+            normalized_game,
+        )
+        task = self._catalog_tasks.get(key)
+        if task and not task.done():
+            return
+        task = self.loop.create_task(asyncio.to_thread(
+            self.catalog.matching_sets_for_typed_set,
+            card_name,
+            set_name,
+            normalized_game,
+            CATALOG_BUILD_BUDGET,
+        ))
+        self._catalog_tasks[key] = task
+
+        def clear_finished(completed: asyncio.Task) -> None:
+            if self._catalog_tasks.get(key) is completed:
+                self._catalog_tasks.pop(key, None)
+
+        task.add_done_callback(clear_finished)
 
     async def setup_hook(self) -> None:
         # A transient command-registration failure must not prevent the gateway

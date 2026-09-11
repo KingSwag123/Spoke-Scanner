@@ -651,6 +651,117 @@ class TCGCSVWatchCatalogTests(unittest.TestCase):
             ["Legend of Blue Eyes"],
         )
 
+    def test_typed_set_lookup_reaches_late_group_without_full_product_scan(self):
+        calls = []
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        def fake_get(url, **_kwargs):
+            calls.append(url)
+            if url.endswith("/groups"):
+                if "/3/groups" in url:
+                    # Silver Tempest is deliberately after the normal first
+                    # batch; typed lookup must still request this one group.
+                    return Response({"results": [
+                        *[
+                            {"groupId": index, "name": f"Earlier Set {index}"}
+                            for index in range(1, 40)
+                        ],
+                        {"groupId": 999, "name": "Silver Tempest", "abbreviation": "SIT"},
+                    ]})
+                return Response({"results": [
+                    {"groupId": 77, "name": "Unrelated Expansion"},
+                ]})
+            if url.endswith("/3/999/products"):
+                return Response({"results": [{
+                    "name": "Lugia V 186/195",
+                    "extendedData": [
+                        {"name": "Number", "value": "186"},
+                        {"name": "Rarity", "value": "Ultra Rare"},
+                    ],
+                }]})
+            self.fail(f"unexpected product download: {url}")
+
+        catalog = TCGCSVWatchCatalog()
+        with patch("tcgcsv_catalog.requests.get", side_effect=fake_get):
+            lookup = catalog.matching_sets_for_typed_set(
+                "Lugia", "Silver Tempest", budget=2
+            )
+            # The second keystroke/callback reuses the process cache rather
+            # than launching another late-group product download.
+            cached = catalog.matching_sets_for_typed_set(
+                "Lugia", "Silver Tempest", budget=2
+            )
+
+        self.assertFalse(lookup.pending)
+        self.assertEqual(
+            [(entry.game, entry.name) for entry in lookup.sets],
+            [("pokemon", "Silver Tempest")],
+        )
+        self.assertEqual(cached.sets, lookup.sets)
+        self.assertEqual(
+            [url for url in calls if url.endswith("/products")],
+            ["https://tcgcsv.com/tcgplayer/3/999/products"],
+        )
+        # The targeted row is immediately usable even though the broad catalog
+        # was not populated with the 39 earlier groups.
+        self.assertEqual(
+            catalog.rarities("Lugia", "pokemon:999"), ["Ultra Rare"]
+        )
+        self.assertFalse(catalog._snapshots["pokemon"].complete)
+        selected, rarity, error = catalog.validate(
+            "Lugia", "pokemon", "pokemon:999", "Ultra Rare"
+        )
+        self.assertEqual((selected.name, rarity, error),
+                         ("Silver Tempest", "Ultra Rare", None))
+
+    def test_typed_set_upstream_failure_stays_loading_not_card_missing(self):
+        class BadJsonResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                raise ValueError("HTML maintenance page")
+
+        catalog = TCGCSVWatchCatalog()
+        with patch("tcgcsv_catalog.requests.get", return_value=BadJsonResponse()):
+            lookup = catalog.matching_sets_for_typed_set(
+                "Lugia", "Silver Tempest", "pokemon", budget=.2
+            )
+        self.assertEqual(lookup.sets, ())
+        self.assertTrue(lookup.pending)
+        self.assertIn(
+            "still loading",
+            catalog.validate(
+                "Lugia", "pokemon", tcgcsv_catalog.CATALOG_LOADING_VALUE, None
+            )[2],
+        )
+
+    def test_typed_set_lookup_honors_interactive_deadline(self):
+        def slow_get(_url, **_kwargs):
+            time.sleep(.15)
+            return type("Response", (), {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"results": []},
+            })()
+
+        catalog = TCGCSVWatchCatalog()
+        started = time.monotonic()
+        with patch("tcgcsv_catalog.requests.get", side_effect=slow_get):
+            lookup = catalog.matching_sets_for_typed_set(
+                "Lugia", "Silver Tempest", "pokemon", budget=.01
+            )
+        self.assertLess(time.monotonic() - started, .10)
+        self.assertTrue(lookup.pending)
+
 
 class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
