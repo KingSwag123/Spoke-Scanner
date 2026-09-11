@@ -55,6 +55,83 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
             ("Pikachu V", 30),
         ])
 
+    def test_filtered_watch_round_trips_and_pending_alert_keeps_filters(self):
+        self.store.upsert_watch(
+            self.user_id,
+            "Pikachu V",
+            30,
+            "pokemon",
+            "Base Set",
+            "BS",
+            "Holo Rare",
+        )
+        watch = self.store.list_watches_for_user(self.user_id)[0]
+        self.assertEqual(
+            (watch.game, watch.set_name, watch.set_code, watch.rarity),
+            ("pokemon", "Base Set", "BS", "Holo Rare"),
+        )
+        self.store.enqueue_matches([
+            {
+                "item_id": f"wrong-filter-{self.user_id}",
+                "title": "Pokemon Pikachu V Base Set Ultra Rare",
+                "game_name": "pokemon",
+                "price": 20,
+                "shipping": 2,
+                "url": "https://example.com/wrong-filter",
+            },
+            {
+                "item_id": f"right-filter-{self.user_id}",
+                "title": "Pokemon Pikachu V Base Set Holo Rare",
+                "game_name": "pokemon",
+                "price": 20,
+                "shipping": 2,
+                "url": "https://example.com/right-filter",
+            },
+        ])
+        pending = self.store.pending(1000)
+        matching = [
+            alert for alert in pending
+            if alert.user_id == self.user_id
+            and alert.item_id == f"right-filter-{self.user_id}"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            (matching[0].game, matching[0].set_name,
+             matching[0].set_code, matching[0].rarity),
+            ("pokemon", "Base Set", "BS", "Holo Rare"),
+        )
+        self.assertFalse(any(
+            alert.user_id == self.user_id
+            and alert.item_id == f"wrong-filter-{self.user_id}"
+            for alert in pending
+        ))
+
+    def test_updating_phrase_rechecks_its_pending_alert_transactionally(self):
+        item_id = f"replace-filter-{self.user_id}"
+        listing = {
+            "item_id": item_id,
+            "title": "Pokemon Pikachu V Base Set Holo Rare",
+            "game_name": "pokemon",
+            "price": 20,
+            "shipping": 2,
+            "url": "https://example.com/replace-filter",
+        }
+        self.store.upsert_watch(self.user_id, "Pikachu V", 30)
+        self.store.enqueue_matches([listing])
+        stale_alert = next(
+            alert for alert in self.store.pending(1000)
+            if alert.user_id == self.user_id and alert.item_id == item_id
+        )
+        self.store.upsert_watch(
+            self.user_id, "Pikachu V", 30, "pokemon", "Base Set",
+            None, "Ultra Rare",
+        )
+        self.assertFalse(any(
+            alert.user_id == self.user_id and alert.item_id == item_id
+            for alert in self.store.pending(1000)
+        ))
+        self.assertFalse(self.store.pending_is_current(stale_alert))
+
     def test_enqueue_and_complete_are_race_safe(self):
         item_id = f"race-{self.user_id}"
         item = self.listing(item_id)

@@ -9,3 +9,4 @@
 - [TCGplayer & Yahoo JP lanes](tcgplayer-yahoo-lanes.md) — mp-search API quirks (50/page, Unopened filter), best-price-improvement alert gating, Yahoo free-ship-only anchor parsing.
 - [Market-price cache TTL](price-cache-ttl.md) — price cache MUST persist across cycles (TTL); wiping it every cycle caused 429 storms that delayed pings ~1hr. Never cache transient failures (429/5xx/network/bad-JSON) — only genuine no-match. Don't lower CHECK_INTERVAL (eBay quota).
 - [Apify connector runtime](apify-connector-runtime.md) — sold comps use the JS connector helper because the generated Python SDK is unavailable; enrichment must stay async, strict, cached, and cost-capped.
+- [Watch catalog completeness](watch-catalog.md) — bounded catalog loading must advance through missing groups, not repeatedly fetch the same prefix.

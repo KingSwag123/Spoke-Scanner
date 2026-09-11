@@ -7,7 +7,22 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from watchlist_bot import WatchlistBot, WatchlistStore, _unsupported_game_name
+import tcgcsv_catalog
+from tcgcsv_catalog import (
+    CatalogProduct,
+    CatalogSet,
+    CatalogSnapshot,
+    TCGCSVWatchCatalog,
+    canonical_rarity,
+    rarity_matches_title,
+)
+from watchlist_bot import (
+    Watch,
+    WatchlistBot,
+    WatchlistStore,
+    _listing_matches_watch_filters,
+    _unsupported_game_name,
+)
 
 
 class WatchlistStoreTests(unittest.TestCase):
@@ -69,6 +84,74 @@ class WatchlistStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.pending_count(), 1)
         self.store.delete_watch(123, "Pikachu-V")
+        self.assertEqual(self.store.pending_count(), 0)
+
+    def test_catalog_filters_fail_closed_but_unfiltered_watches_still_work(self):
+        self.store.upsert_watch(
+            123, "Pikachu V", 50, "pokemon", "Base Set", "BS", "Holo Rare"
+        )
+        self.store.upsert_watch(456, "Pikachu V", 50)
+        listings = [
+            {
+                "item_id": "wrong-rarity",
+                "title": "Pokemon Pikachu V Base Set Ultra Rare",
+                "game_name": "pokemon",
+                "price": 20, "shipping": 0, "url": "https://example.com/1",
+            },
+            {
+                "item_id": "unproven-set",
+                "title": "Pokemon Pikachu V Holo Rare",
+                "game_name": "pokemon",
+                "price": 20, "shipping": 0, "url": "https://example.com/2",
+            },
+            {
+                "item_id": "matching-print",
+                "title": "Pokemon Pikachu V Base Set Holo Rare",
+                "game_name": "pokemon",
+                "price": 20, "shipping": 0, "url": "https://example.com/3",
+            },
+        ]
+        self.assertEqual(self.store.enqueue_matches(listings), 4)
+        pending = self.store.pending(10)
+        # User 123 receives only the proven set + rarity match. User 456's
+        # existing unfiltered watch continues to receive all three.
+        self.assertEqual(
+            sorted((entry.user_id, entry.item_id) for entry in pending),
+            [(123, "matching-print"), (456, "matching-print"),
+             (456, "unproven-set"), (456, "wrong-rarity")],
+        )
+        filtered = next(entry for entry in pending if entry.user_id == 123)
+        self.assertEqual(filtered.set_name, "Base Set")
+        self.assertEqual(filtered.rarity, "Holo Rare")
+
+    def test_updating_same_phrase_rechecks_queued_alerts_in_transaction(self):
+        item = {
+            "item_id": "recheck",
+            "title": "Pokemon Pikachu V Base Set Holo Rare",
+            "game_name": "pokemon",
+            "price": 20, "shipping": 0, "url": "https://example.com/recheck",
+        }
+        self.store.upsert_watch(123, "Pikachu V", 50)
+        self.store.enqueue_matches([item])
+        self.assertEqual(self.store.pending_count(), 1)
+        stale_alert = self.store.pending(10)[0]
+
+        # Same listing still satisfies the replacement filter, so it remains
+        # queued with the replacement filter details instead of stale details.
+        self.store.upsert_watch(
+            123, "Pikachu V", 50, "pokemon", "Base Set", None, "Holo Rare"
+        )
+        pending = self.store.pending(10)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(
+            (pending[0].set_name, pending[0].rarity), ("Base Set", "Holo Rare")
+        )
+        self.assertFalse(self.store.pending_is_current(stale_alert))
+
+        # A changed rarity invalidates that previously queued match immediately.
+        self.store.upsert_watch(
+            123, "Pikachu V", 50, "pokemon", "Base Set", None, "Ultra Rare"
+        )
         self.assertEqual(self.store.pending_count(), 0)
 
     def test_old_watch_keyed_delivery_history_is_migrated(self):
@@ -138,6 +221,228 @@ class WatchlistGameValidationTests(unittest.TestCase):
         self.assertIsNone(_unsupported_game_name("Pikachu V alternate art"))
         self.assertIsNone(_unsupported_game_name("Yu-Gi-Oh booster box"))
         self.assertIsNone(_unsupported_game_name("Yugioh LOB-001 PSA 10"))
+
+
+class TCGCSVWatchCatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.catalog = TCGCSVWatchCatalog()
+        pokemon = CatalogSet(
+            "pokemon", 101, "Base Set", "BS",
+            (CatalogProduct("Pikachu V", "Holo Rare"),
+             CatalogProduct("Mew V", "Ultra Rare")),
+        )
+        mtg = CatalogSet(
+            "mtg", 202, "Example Expansion", "EX",
+            (CatalogProduct("Pikachu V", "Mythic Rare"),),
+        )
+        no_pikachu = CatalogSet(
+            "pokemon", 303, "Other Set", "OS",
+            (CatalogProduct("Charizard", "Rare"),),
+        )
+        self.catalog._snapshots = {
+            "pokemon": CatalogSnapshot((pokemon, no_pikachu), True),
+            "mtg": CatalogSnapshot((mtg,), True),
+            "lorcana": CatalogSnapshot((), True),
+            "onepiece": CatalogSnapshot((), True),
+            "yugioh": CatalogSnapshot((), True),
+        }
+        self.catalog._until = {
+            game: float("inf") for game in self.catalog._snapshots
+        }
+
+    def test_set_results_are_card_scoped_not_all_game_sets(self):
+        self.assertEqual(
+            [(entry.game, entry.name) for entry in self.catalog.matching_sets("Pikachu V")],
+            [("mtg", "Example Expansion"), ("pokemon", "Base Set")],
+        )
+        self.assertNotIn(
+            "Other Set",
+            [entry.name for entry in self.catalog.matching_sets("Pikachu V")],
+        )
+
+    def test_rarity_is_scoped_to_card_and_selected_set_and_validation_is_strict(self):
+        self.assertEqual(
+            self.catalog.rarities("Pikachu V", "pokemon:101"), ["Holo Rare"]
+        )
+        selected, rarity, error = self.catalog.validate(
+            "Pikachu V", "pokemon", "pokemon:101", "Holo Rare"
+        )
+        self.assertEqual((selected.name, rarity, error), ("Base Set", "Holo Rare", None))
+        self.assertEqual(
+            self.catalog.validate(
+                "Pikachu V", "pokemon", "pokemon:303", "Rare"
+            )[2],
+            "That set does not contain the entered card name.",
+        )
+        self.assertIn(
+            "not available",
+            self.catalog.validate(
+                "Pikachu V", "pokemon", "pokemon:101", "Made Up Rare"
+            )[2],
+        )
+
+    def test_card_names_use_whole_normalized_words(self):
+        self.catalog._snapshots["pokemon"] = CatalogSnapshot((
+            CatalogSet(
+                "pokemon", 404, "Mewtwo Set", "MS",
+                (CatalogProduct("Mewtwo V", "Rare"),),
+            ),
+        ), True)
+        self.assertEqual(self.catalog.matching_sets("Mew", "pokemon"), [])
+        self.assertEqual(self.catalog.rarities("Mew", "pokemon:404"), [])
+        self.assertEqual(
+            self.catalog.matching_sets("Mewtwo", "pokemon")[0].name,
+            "Mewtwo Set",
+        )
+
+    def test_only_catalog_proven_non_yugioh_unique_codes_are_marked_safe(self):
+        groups = ({"groupId": 1, "name": "Example", "abbreviation": "ABC"},)
+        products = {1: (CatalogProduct("Example Card", "Rare"),)}
+        expiry = {1: float("inf")}
+        mtg = self.catalog._snapshot_from_products("mtg", groups, products, expiry)
+        ygo = self.catalog._snapshot_from_products("yugioh", groups, products, expiry)
+        self.assertTrue(mtg.sets[0].abbreviation_unique)
+        self.assertFalse(ygo.sets[0].abbreviation_unique)
+
+    def test_rarity_codes_are_readable_and_match_only_as_full_tokens(self):
+        self.assertEqual(canonical_rarity("mtg", "M"), "Mythic Rare")
+        self.assertEqual(canonical_rarity("onepiece", "SEC"), "Secret Rare")
+        self.assertEqual(canonical_rarity("onepiece", "UC"), "Uncommon")
+        self.assertTrue(rarity_matches_title(
+            "mtg", "Mythic Rare", "Black Lotus (M)"
+        ))
+        self.assertTrue(rarity_matches_title(
+            "onepiece", "Secret Rare", "Monkey D. Luffy SEC"
+        ))
+        self.assertFalse(rarity_matches_title(
+            "mtg", "Mythic Rare", "Mewtwo V Rare"
+        ))
+
+    def test_unique_non_yugioh_set_code_is_allowed_but_yugioh_code_is_not(self):
+        item = {
+            "title": "Magic Example Card ABC Mythic Rare",
+            "game_name": "mtg",
+        }
+        mtg_watch = Watch(
+            1, 1, "Example Card", "example card", 50,
+            "mtg", "Long Set Name", "ABC", "Mythic Rare",
+        )
+        self.assertTrue(_listing_matches_watch_filters(
+            mtg_watch, item, item["title"]
+        ))
+        ygo_watch = Watch(
+            1, 1, "Example Card", "example card", 50,
+            "yugioh", "Long Set Name", "ABC", "Mythic Rare",
+        )
+        ygo_item = {**item, "game_name": "yugioh"}
+        self.assertFalse(_listing_matches_watch_filters(
+            ygo_watch, ygo_item, ygo_item["title"]
+        ))
+
+    def test_partial_build_keeps_completed_groups_and_advances_next_batch(self):
+        calls = []
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        def fake_get(url, **_kwargs):
+            calls.append(url)
+            if url.endswith("/groups"):
+                return Response({"results": [
+                    {"groupId": 1, "name": "First Set", "abbreviation": "FS"},
+                    {"groupId": 2, "name": "Second Set", "abbreviation": "SS"},
+                ]})
+            group_id = url.split("/")[-2]
+            return Response({"results": [{
+                "name": f"Pikachu V {group_id}",
+                "extendedData": [
+                    {"name": "Number", "value": "1"},
+                    {"name": "Rarity", "value": "Rare"},
+                ],
+            }]})
+
+        catalog = TCGCSVWatchCatalog()
+        with patch.object(tcgcsv_catalog, "CATALOG_BATCH_SIZE", 1), patch(
+            "tcgcsv_catalog.requests.get", side_effect=fake_get
+        ):
+            self.assertTrue(catalog.ensure_game("pokemon"))
+            self.assertFalse(catalog._snapshots["pokemon"].complete)
+            self.assertTrue(catalog.ensure_game("pokemon"))
+
+        product_calls = [url for url in calls if url.endswith("/products")]
+        self.assertEqual(
+            product_calls,
+            [
+                "https://tcgcsv.com/tcgplayer/3/1/products",
+                "https://tcgcsv.com/tcgplayer/3/2/products",
+            ],
+        )
+        self.assertEqual(calls.count("https://tcgcsv.com/tcgplayer/3/groups"), 1)
+        self.assertTrue(catalog._snapshots["pokemon"].complete)
+        self.assertEqual(
+            [entry.name for entry in catalog.matching_sets("Pikachu V", "pokemon")],
+            ["First Set", "Second Set"],
+        )
+
+    def test_transient_group_failure_retries_without_redownloading_successes(self):
+        calls = []
+        attempts = 0
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"results": [{
+                    "name": "Exodia the Forbidden One",
+                    "extendedData": [
+                        {"name": "Number", "value": "LOB-124"},
+                        {"name": "Rarity", "value": "Ultra Rare"},
+                    ],
+                }]}
+
+        def fake_get(url, **_kwargs):
+            nonlocal attempts
+            calls.append(url)
+            if url.endswith("/groups"):
+                return type("Groups", (), {
+                    "raise_for_status": lambda self: None,
+                    "json": lambda self: {"results": [{
+                        "groupId": 1, "name": "Legend of Blue Eyes", "abbreviation": "LOB",
+                    }]},
+                })()
+            attempts += 1
+            if attempts == 1:
+                raise tcgcsv_catalog.requests.RequestException("temporary outage")
+            return Response()
+
+        catalog = TCGCSVWatchCatalog()
+        with patch("tcgcsv_catalog.requests.get", side_effect=fake_get):
+            self.assertFalse(catalog.ensure_game("yugioh"))
+            # Expire this test's bounded retry window rather than sleeping.
+            catalog._failed_until["yugioh"][1] = 0
+            catalog._next_batch_at["yugioh"] = 0
+            self.assertTrue(catalog.ensure_game("yugioh"))
+
+        self.assertEqual(
+            calls.count("https://tcgcsv.com/tcgplayer/2/groups"), 1
+        )
+        self.assertEqual(
+            calls.count("https://tcgcsv.com/tcgplayer/2/1/products"), 2
+        )
+        self.assertEqual(
+            [entry.name for entry in catalog.matching_sets(
+                "Exodia the Forbidden One", "yugioh"
+            )],
+            ["Legend of Blue Eyes"],
+        )
 
 
 class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):

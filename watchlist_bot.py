@@ -18,6 +18,12 @@ from discord import app_commands
 from discord.ext import commands
 
 from sold_comps import format_sold_comps, get_sold_comps
+from tcgcsv_catalog import (
+    GAME_LABELS,
+    GAMES,
+    TCGCSVWatchCatalog,
+    rarity_matches_title,
+)
 
 
 _SUPPORTED_GAME_ALIASES = (
@@ -72,6 +78,10 @@ class Watch:
     item_name: str
     normalized_name: str
     max_price: float
+    game: str | None = None
+    set_name: str | None = None
+    set_code: str | None = None
+    rarity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,82 @@ class PendingDM:
     max_price: float
     payload: dict
     attempts: int
+    game: str | None = None
+    set_name: str | None = None
+    set_code: str | None = None
+    rarity: str | None = None
+
+
+def _watch_filter_description(watch: Watch | PendingDM) -> str:
+    """A compact user-facing description of optional validated catalog filters."""
+    parts = []
+    if watch.game:
+        parts.append(GAME_LABELS.get(watch.game, watch.game))
+    if watch.set_name:
+        label = watch.set_name
+        if watch.set_code:
+            label += f" ({watch.set_code})"
+        parts.append(f"set: {label}")
+    if watch.rarity:
+        parts.append(f"rarity: {watch.rarity}")
+    return " • ".join(parts)
+
+
+def _listing_matches_watch_filters(watch: Watch, item: dict, title: str) -> bool:
+    """Fail closed when a selected catalog filter cannot be proven by a listing."""
+    if not any((watch.game, watch.set_name, watch.rarity)):
+        return True
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    def values_for(*keys: str) -> list[str]:
+        values = [str(item[key]) for key in keys if item.get(key) is not None]
+        values.extend(
+            str(metadata[key]) for key in keys if metadata.get(key) is not None
+        )
+        return values
+
+    if watch.game:
+        listing_games = values_for("game_name", "game")
+        # Game inference is already performed by every normalized source. Do not
+        # try to guess from an ambiguous title when its metadata is missing.
+        if not listing_games or _normalize_term(listing_games[0]) != _normalize_term(watch.game):
+            return False
+
+    searchable = " ".join([title, *values_for(
+        "set_name", "set", "tcg_set", "rarity", "card_rarity",
+    )])
+    bounded = f" {_normalize_term(searchable)} "
+
+    if watch.set_name:
+        set_name_matches = f" {_normalize_term(watch.set_name)} " in bounded
+        # set_code is persisted only when TCGCSV established that it is unique
+        # inside its non-Yu-Gi-Oh game. Yu-Gi-Oh's repeated abbreviations must
+        # always retain exact-name/metadata evidence (see yugioh-catalog.md).
+        set_code_matches = bool(watch.set_code and watch.game != "yugioh") and (
+            f" {_normalize_term(watch.set_code)} " in bounded
+        )
+        if not (set_name_matches or set_code_matches):
+            return False
+    if watch.rarity and not rarity_matches_title(watch.game or "", watch.rarity, searchable):
+        return False
+    return True
+
+
+def _watch_accepts_listing(watch: Watch, item: dict) -> bool:
+    """Shared predicate for new listings and pending-DM re-evaluation."""
+    title = str(item.get("title") or "")
+    url = str(item.get("url") or "")
+    try:
+        total = float(item.get("price", 0)) + float(item.get("shipping", 0))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        title and url and total > 0
+        and f" {watch.normalized_name} " in f" {_normalize_term(title)} "
+        and total <= watch.max_price
+        and _listing_matches_watch_filters(watch, item, title)
+    )
 
 
 class WatchlistStore:
@@ -116,6 +202,10 @@ class WatchlistStore:
                     item_name TEXT NOT NULL,
                     normalized_name TEXT NOT NULL,
                     max_price REAL NOT NULL CHECK (max_price > 0),
+                    game TEXT,
+                    set_name TEXT,
+                    set_code TEXT,
+                    rarity TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, normalized_name)
@@ -136,6 +226,10 @@ class WatchlistStore:
                     item_id TEXT NOT NULL,
                     item_name TEXT NOT NULL,
                     max_price REAL NOT NULL,
+                    game TEXT,
+                    set_name TEXT,
+                    set_code TEXT,
+                    rarity TEXT,
                     payload TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt REAL NOT NULL DEFAULT 0,
@@ -147,6 +241,26 @@ class WatchlistStore:
                     ON pending_watch_dms(next_attempt);
                 """
             )
+            # SQLite is the backward-compatible local/legacy store. PostgreSQL
+            # intentionally receives its additive columns through Publish rather
+            # than application-start DDL.
+            watch_columns = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA table_info(watchlists)"
+                ).fetchall()
+            }
+            pending_columns = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA table_info(pending_watch_dms)"
+                ).fetchall()
+            }
+            for column in ("game", "set_name", "set_code", "rarity"):
+                if column not in watch_columns:
+                    conn.execute(f"ALTER TABLE watchlists ADD COLUMN {column} TEXT")
+                if column not in pending_columns:
+                    conn.execute(
+                        f"ALTER TABLE pending_watch_dms ADD COLUMN {column} TEXT"
+                    )
             # Normalize watches created by older versions before delivery rows
             # are converted from watch ownership to user ownership. If multiple
             # old spellings collapse to the same phrase, the most recently
@@ -229,26 +343,86 @@ class WatchlistStore:
                     "RENAME TO watchlist_deliveries"
                 )
 
-    def upsert_watch(self, user_id: int, item_name: str, max_price: float) -> None:
+    def upsert_watch(
+        self, user_id: int, item_name: str, max_price: float,
+        game: str | None = None, set_name: str | None = None,
+        set_code: str | None = None, rarity: str | None = None,
+    ) -> None:
         normalized = _normalize_term(item_name)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO watchlists
-                    (user_id, item_name, normalized_name, max_price)
-                VALUES (?, ?, ?, ?)
+                    (user_id, item_name, normalized_name, max_price, game,
+                     set_name, set_code, rarity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, normalized_name) DO UPDATE SET
                     item_name = excluded.item_name,
                     max_price = excluded.max_price,
+                    game = excluded.game,
+                    set_name = excluded.set_name,
+                    set_code = excluded.set_code,
+                    rarity = excluded.rarity,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (user_id, item_name.strip(), normalized, max_price),
+                (user_id, item_name.strip(), normalized, max_price, game,
+                 set_name, set_code, rarity),
             )
+            # A changed budget/filter must not leave an old pending match on its
+            # way to the user. Re-check its saved listing under the replacement
+            # watch inside this transaction, retaining only still-valid alerts.
+            replacement = Watch(
+                id=0, user_id=user_id, item_name=item_name.strip(),
+                normalized_name=normalized, max_price=max_price, game=game,
+                set_name=set_name, set_code=set_code, rarity=rarity,
+            )
+            pending = conn.execute(
+                """
+                SELECT item_id, item_name, payload
+                FROM pending_watch_dms
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchall()
+            for alert in pending:
+                if _normalize_term(alert["item_name"]) != normalized:
+                    continue
+                conn.execute(
+                    "DELETE FROM pending_watch_dms WHERE user_id = ? AND item_id = ?",
+                    (user_id, alert["item_id"]),
+                )
+                try:
+                    item = json.loads(alert["payload"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not _watch_accepts_listing(replacement, item):
+                    continue
+                delivered = conn.execute(
+                    "SELECT 1 FROM watchlist_deliveries WHERE user_id = ? AND item_id = ?",
+                    (user_id, alert["item_id"]),
+                ).fetchone()
+                if delivered:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO pending_watch_dms
+                        (user_id, item_id, item_name, max_price, game, set_name,
+                         set_code, rarity, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id, alert["item_id"], replacement.item_name,
+                        replacement.max_price, replacement.game,
+                        replacement.set_name, replacement.set_code,
+                        replacement.rarity, json.dumps(item, ensure_ascii=False),
+                    ),
+                )
 
     def list_watches(self) -> list[Watch]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, user_id, item_name, normalized_name, max_price "
+                "SELECT id, user_id, item_name, normalized_name, max_price, "
+                "game, set_name, set_code, rarity "
                 "FROM watchlists"
             ).fetchall()
         return [Watch(**dict(row)) for row in rows]
@@ -257,7 +431,8 @@ class WatchlistStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, user_id, item_name, normalized_name, max_price
+                SELECT id, user_id, item_name, normalized_name, max_price,
+                       game, set_name, set_code, rarity
                 FROM watchlists
                 WHERE user_id = ?
                 ORDER BY normalized_name
@@ -338,7 +513,8 @@ class WatchlistStore:
                 matching_by_user: dict[int, Watch] = {}
                 for watch in watches:
                     if (f" {watch.normalized_name} " not in bounded_title
-                            or total > watch.max_price):
+                            or total > watch.max_price
+                            or not _listing_matches_watch_filters(watch, item, title)):
                         continue
                     previous = matching_by_user.get(watch.user_id)
                     if (previous is None
@@ -357,14 +533,19 @@ class WatchlistStore:
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO pending_watch_dms
-                            (user_id, item_id, item_name, max_price, payload)
-                        VALUES (?, ?, ?, ?, ?)
+                            (user_id, item_id, item_name, max_price, game,
+                             set_name, set_code, rarity, payload)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             watch.user_id,
                             item_id,
                             watch.item_name,
                             watch.max_price,
+                            watch.game,
+                            watch.set_name,
+                            watch.set_code,
+                            watch.rarity,
                             json.dumps(item, ensure_ascii=False),
                         ),
                     )
@@ -376,7 +557,8 @@ class WatchlistStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT user_id, item_id, item_name, max_price, payload, attempts
+                SELECT user_id, item_id, item_name, max_price, game, set_name,
+                       set_code, rarity, payload, attempts
                 FROM pending_watch_dms
                 WHERE next_attempt <= ?
                 ORDER BY created_at, user_id, item_id
@@ -399,9 +581,32 @@ class WatchlistStore:
                     max_price=row["max_price"],
                     payload=payload,
                     attempts=row["attempts"],
+                    game=row["game"],
+                    set_name=row["set_name"],
+                    set_code=row["set_code"],
+                    rarity=row["rarity"],
                 )
             )
         return pending
+
+    def pending_is_current(self, alert: PendingDM) -> bool:
+        """Avoid delivering an alert replaced after the worker read its queue."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT item_name, max_price, game, set_name, set_code, rarity
+                FROM pending_watch_dms
+                WHERE user_id = ? AND item_id = ?
+                """,
+                (alert.user_id, alert.item_id),
+            ).fetchone()
+        return row is not None and (
+            row["item_name"], float(row["max_price"]), row["game"],
+            row["set_name"], row["set_code"], row["rarity"],
+        ) == (
+            alert.item_name, float(alert.max_price), alert.game,
+            alert.set_name, alert.set_code, alert.rarity,
+        )
 
     def complete(self, user_id: int, item_id: str) -> None:
         with self._connect() as conn:
@@ -435,14 +640,16 @@ class WatchlistStore:
 
 
 class WatchlistBot(commands.Bot):
-    def __init__(self, token: str, db_path: str, store=None):
+    def __init__(self, token: str, db_path: str, store=None, catalog=None):
         super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.none())
         self.token_value = token
         self.store = store or WatchlistStore(db_path)
+        self.catalog = catalog or TCGCSVWatchCatalog()
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._last_health_warning = 0.0
         self._enrichment_tasks: set[asyncio.Task] = set()
+        self._catalog_tasks: dict[str, asyncio.Task] = {}
         self._register_commands()
 
     def _register_commands(self) -> None:
@@ -453,17 +660,38 @@ class WatchlistBot(commands.Bot):
         @app_commands.describe(
             item_name="Words to match in the listing title",
             max_price="Maximum total price including shipping (USD)",
+            game="Optional game filter; choose this when names are ambiguous",
+            set_name=("Optional catalog-validated set (autocomplete after card "
+                      "name; retry shortly if results are loading)"),
+            rarity=("Optional catalog-validated rarity (requires a set; retry "
+                    "shortly if results are loading)"),
         )
+        @app_commands.choices(game=[
+            app_commands.Choice(name=GAME_LABELS[game], value=game)
+            for game in GAMES
+        ])
         async def watch(
             interaction: discord.Interaction,
             item_name: app_commands.Range[str, 2, 100],
             max_price: app_commands.Range[float, 0.01, 1_000_000.0],
+            game: str | None = None,
+            set_name: str | None = None,
+            rarity: str | None = None,
         ) -> None:
+            # Namespace values are normally raw strings, but normalize Choice
+            # too so direct callback invocation and Discord.py version changes
+            # cannot bypass the fixed game allowlist.
+            game = getattr(game, "value", game)
             cleaned = " ".join(item_name.split())
             if len(_normalize_term(cleaned)) < 2:
                 await interaction.response.send_message(
                     "Give me at least two visible characters so I know what to scout for.",
                     ephemeral=True,
+                )
+                return
+            if game is not None and game not in GAMES:
+                await interaction.response.send_message(
+                    "Choose a game from the provided list.", ephemeral=True
                 )
                 return
             unsupported_game = _unsupported_game_name(cleaned)
@@ -475,12 +703,32 @@ class WatchlistBot(commands.Bot):
                     ephemeral=True,
                 )
                 return
+            # A set choice is an opaque TCGCSV game:group id, so direct typed
+            # values cannot turn into arbitrary filters. Validation happens again
+            # here rather than trusting Discord's autocomplete client.
+            catalog_set = None
+            if set_name or rarity:
+                catalog_set, rarity, validation_error = await asyncio.to_thread(
+                    self.catalog.validate, cleaned, game, set_name, rarity
+                )
+                if validation_error:
+                    await interaction.response.send_message(
+                        validation_error, ephemeral=True
+                    )
+                    return
+                if catalog_set:
+                    game = catalog_set.game
             try:
                 await asyncio.to_thread(
                     self.store.upsert_watch,
                     interaction.user.id,
                     cleaned,
                     float(max_price),
+                    game,
+                    catalog_set.name if catalog_set else None,
+                    (catalog_set.abbreviation
+                     if catalog_set and catalog_set.abbreviation_unique else None),
+                    rarity,
                 )
             except (sqlite3.Error, psycopg.Error):
                 print("[WATCHLIST][ERROR] Could not save /watch entry")
@@ -491,12 +739,88 @@ class WatchlistBot(commands.Bot):
                 )
                 return
             safe_name = discord.utils.escape_markdown(cleaned)
+            filter_text = _watch_filter_description(
+                Watch(
+                    id=0, user_id=interaction.user.id, item_name=cleaned,
+                    normalized_name=_normalize_term(cleaned), max_price=float(max_price),
+                    game=game, set_name=catalog_set.name if catalog_set else None,
+                    set_code=(catalog_set.abbreviation
+                              if catalog_set and catalog_set.abbreviation_unique
+                              else None),
+                    rarity=rarity,
+                )
+            )
+            filters = f"\nFilters: **{discord.utils.escape_markdown(filter_text)}**." if filter_text else ""
             await interaction.response.send_message(
                 f"I'm on the hunt for **{safe_name}** at "
                 f"**${float(max_price):,.2f} or less**, including shipping. "
-                "I'll send you a DM if I spot one!",
+                f"I'll send you a DM if I spot one!{filters}\n"
+                "One watch is kept per item phrase; adding it again updates its filters.",
                 ephemeral=True,
             )
+
+        async def set_autocomplete(
+            interaction: discord.Interaction, current: str
+        ) -> list[app_commands.Choice[str]]:
+            card_name = str(getattr(interaction.namespace, "item_name", "") or "")
+            game = getattr(interaction.namespace, "game", None)
+            game = getattr(game, "value", game)
+            if game not in GAMES:
+                game = None
+            if len(_normalize_term(card_name)) < 2:
+                return []
+            if ((game and self.catalog.needs_refresh(game))
+                    or (not game and any(
+                        self.catalog.needs_refresh(candidate)
+                        for candidate in GAMES
+                    ))):
+                self._start_catalog_load(game)
+            matching_sets = self.catalog.matching_sets(card_name, game)
+            if matching_sets is None:
+                self._start_catalog_load(game)
+                # Discord autocomplete cannot display a durable status message.
+                # Submit validation explicitly tells the user to retry instead of
+                # accepting a guessed set while this background read is cold.
+                return []
+            needle = _normalize_term(current)
+            return [
+                app_commands.Choice(
+                    name=(f"{GAME_LABELS[entry.game]}: {entry.name}"
+                          + (f" [{entry.abbreviation}]" if entry.abbreviation else ""))[:100],
+                    value=entry.token,
+                )
+                for entry in matching_sets
+                if not needle or needle in _normalize_term(entry.name)
+            ][:25]
+
+        async def rarity_autocomplete(
+            interaction: discord.Interaction, current: str
+        ) -> list[app_commands.Choice[str]]:
+            card_name = str(getattr(interaction.namespace, "item_name", "") or "")
+            set_token = getattr(interaction.namespace, "set_name", None)
+            if len(_normalize_term(card_name)) < 2 or not set_token:
+                return []
+            try:
+                selected_game = str(set_token).split(":", 1)[0]
+            except (AttributeError, IndexError):
+                selected_game = None
+            if selected_game in GAMES and self.catalog.needs_refresh(selected_game):
+                self._start_catalog_load(selected_game)
+            rarities = self.catalog.rarities(card_name, set_token)
+            if rarities is None:
+                self._start_catalog_load(
+                    selected_game if selected_game in GAMES else None
+                )
+                return []
+            needle = _normalize_term(current)
+            return [
+                app_commands.Choice(name=entry[:100], value=entry)
+                for entry in rarities
+                if not needle or needle in _normalize_term(entry)
+            ][:25]
+
+        watch.autocomplete("set_name")(set_autocomplete)
+        watch.autocomplete("rarity")(rarity_autocomplete)
 
         @self.tree.command(
             name="unwatch",
@@ -562,6 +886,8 @@ class WatchlistBot(commands.Bot):
             lines = [
                 f"• **{discord.utils.escape_markdown(entry.item_name)}** — "
                 f"${entry.max_price:,.2f} max"
+                + (f" — {discord.utils.escape_markdown(_watch_filter_description(entry))}"
+                   if _watch_filter_description(entry) else "")
                 for entry in watches
             ]
             chunks: list[str] = []
@@ -577,6 +903,19 @@ class WatchlistBot(commands.Bot):
             await interaction.response.send_message(chunks[0], ephemeral=True)
             for chunk in chunks[1:]:
                 await interaction.followup.send(chunk, ephemeral=True)
+
+    def _start_catalog_load(self, game: str | None) -> None:
+        """Start cold TCGCSV reads once per game without delaying autocomplete."""
+        for candidate in ((game,) if game else GAMES):
+            if not self.catalog.needs_refresh(candidate):
+                continue
+            task = self._catalog_tasks.get(candidate)
+            if task and not task.done():
+                continue
+            task = self.loop.create_task(
+                asyncio.to_thread(self.catalog.ensure_game, candidate)
+            )
+            self._catalog_tasks[candidate] = task
 
     async def setup_hook(self) -> None:
         # A transient command-registration failure must not prevent the gateway
@@ -663,6 +1002,11 @@ class WatchlistBot(commands.Bot):
             return False
         delivered = 0
         for entry in pending:
+            if not await asyncio.to_thread(self.store.pending_is_current, entry):
+                # The watch was updated after this worker read the queue. Its
+                # replacement (if still eligible) remains pending for a fresh
+                # worker pass; never send the stale in-memory alert.
+                continue
             item = entry.payload
             total = float(item.get("price", 0)) + float(item.get("shipping", 0))
             result = await self._send_watch_dm(entry, item, total)
@@ -713,7 +1057,11 @@ class WatchlistBot(commands.Bot):
             )
             embed.add_field(
                 name="Your watch",
-                value=f"{watch.item_name} ≤ ${watch.max_price:,.2f}",
+                value=(
+                    f"{watch.item_name} ≤ ${watch.max_price:,.2f}"
+                    + (f"\n{_watch_filter_description(watch)}"
+                       if _watch_filter_description(watch) else "")
+                ),
                 inline=False,
             )
             image_url = str(item.get("image_url") or "")

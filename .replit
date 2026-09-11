@@ -1,4 +1,4 @@
-modules = ["python-3.11", "postgresql-16", "nodejs-24"]
+modules = ["python-3.11", "nodejs-24", "postgresql-16"]
 [agent]
 expertMode = true
 stack = "BEST_EFFORT_FALLBACK"

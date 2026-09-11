@@ -1,0 +1,506 @@
+"""Read-only, bounded-TTL TCGCSV card/set catalog used by Discord /watch.
+
+This is intentionally separate from pricing.  It never searches a marketplace
+and only reads TCGCSV's public category, group, and product endpoints.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import threading
+import time
+from dataclasses import dataclass
+
+import requests
+
+from config import TCGCSV_CATEGORY, _HTTP_HEADERS
+
+
+CATALOG_TTL = 60 * 60
+CATALOG_RETRY_TTL = 120
+CATALOG_BUILD_BUDGET = 12.0
+CATALOG_WORKERS = 4
+CATALOG_BATCH_SIZE = 32
+
+GAMES = ("pokemon", "mtg", "lorcana", "onepiece", "yugioh")
+GAME_LABELS = {
+    "pokemon": "Pokémon",
+    "mtg": "Magic: The Gathering",
+    "lorcana": "Disney Lorcana",
+    "onepiece": "One Piece",
+    "yugioh": "Yu-Gi-Oh!",
+}
+
+_RARITY_CODES = {
+    "mtg": {
+        "m": "Mythic Rare",
+        "r": "Rare",
+        "u": "Uncommon",
+        "c": "Common",
+    },
+    "onepiece": {
+        "c": "Common",
+        "uc": "Uncommon",
+        "r": "Rare",
+        "sr": "Super Rare",
+        "sec": "Secret Rare",
+        "sp": "Special Rare",
+        "tr": "Treasure Rare",
+        "l": "Leader",
+        "p": "Promo",
+    },
+}
+
+
+def normalize_catalog_text(value: str) -> str:
+    """Normalize searchable catalog text without importing the Discord bot."""
+    import re
+
+    return " ".join(re.sub(r"[\W_]+", " ", value.casefold()).split())
+
+
+def contains_catalog_phrase(value: str, phrase: str) -> bool:
+    """Whole normalized words only: ``Mew`` must not match ``Mewtwo``."""
+    needle = normalize_catalog_text(phrase)
+    return bool(needle) and f" {needle} " in f" {normalize_catalog_text(value)} "
+
+
+def canonical_rarity(game: str, value: str) -> str:
+    """Turn terse catalog rarity codes into readable, stable watch labels."""
+    normalized = normalize_catalog_text(value)
+    code_label = _RARITY_CODES.get(game, {}).get(normalized)
+    if code_label:
+        return code_label
+    # TCGCSV sometimes supplies a readable label instead of its code. Keep it
+    # readable while normalizing whitespace/casing consistently for validation.
+    for label in _RARITY_CODES.get(game, {}).values():
+        if normalized == normalize_catalog_text(label):
+            return label
+    return " ".join(word.capitalize() for word in normalized.split())
+
+
+def rarity_matches_title(game: str, rarity: str, value: str) -> bool:
+    """Match a saved canonical rarity against title/metadata aliases safely."""
+    wanted = normalize_catalog_text(rarity)
+    aliases = {wanted}
+    for code, label in _RARITY_CODES.get(game, {}).items():
+        if normalize_catalog_text(label) == wanted:
+            aliases.add(code)
+    return any(contains_catalog_phrase(value, alias) for alias in aliases)
+
+
+@dataclass(frozen=True)
+class CatalogProduct:
+    name: str
+    rarity: str | None
+
+
+@dataclass(frozen=True)
+class CatalogSet:
+    game: str
+    group_id: int
+    name: str
+    abbreviation: str | None
+    products: tuple[CatalogProduct, ...]
+    abbreviation_unique: bool = False
+
+    @property
+    def token(self) -> str:
+        # The group id makes duplicate group names/unusual Yu-Gi-Oh reprints
+        # unambiguous.  It is an opaque catalog key, not user-supplied data.
+        return f"{self.game}:{self.group_id}"
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    sets: tuple[CatalogSet, ...]
+    complete: bool
+
+
+class TCGCSVWatchCatalog:
+    """Thread-safe, in-process cache for autocomplete and server validation."""
+
+    def __init__(self):
+        self._snapshots: dict[str, CatalogSnapshot] = {}
+        self._until: dict[str, float] = {}
+        self._groups: dict[str, tuple[dict, ...]] = {}
+        self._groups_until: dict[str, float] = {}
+        self._products: dict[str, dict[int, tuple[CatalogProduct, ...]]] = {}
+        self._products_until: dict[str, dict[int, float]] = {}
+        self._failed_until: dict[str, dict[int, float]] = {}
+        self._next_batch_at: dict[str, float] = {}
+        self._building: set[str] = set()
+        self._lock = threading.Lock()
+        # A no-game autocomplete may warm all supported games. Limit aggregate
+        # TCGCSV traffic as well as each game's own worker pool.
+        self._network_slots = threading.BoundedSemaphore(2)
+
+    def is_ready(self, game: str) -> bool:
+        with self._lock:
+            return game in self._snapshots and time.monotonic() < self._until.get(game, 0)
+
+    def needs_refresh(self, game: str) -> bool:
+        """Whether a cold, expired, or partial catalog should fetch another batch."""
+        now = time.monotonic()
+        with self._lock:
+            snapshot = self._snapshots.get(game)
+            if snapshot is None or now >= self._until.get(game, 0):
+                return True
+            return not snapshot.complete and now >= self._next_batch_at.get(game, 0)
+
+    def ensure_game(self, game: str) -> bool:
+        """Refresh one game's catalog, with a hard wall-clock budget.
+
+        This synchronous method is deliberately called through asyncio.to_thread
+        by Discord code, keeping gateway/autocomplete work non-blocking.
+        """
+        if game not in GAMES:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            existing = self._snapshots.get(game)
+            if (existing is not None and existing.complete
+                    and now < self._until.get(game, 0)):
+                return game in self._snapshots
+            if (existing is not None and not existing.complete
+                    and now < self._next_batch_at.get(game, 0)):
+                return True
+            if game in self._building:
+                return False
+            self._building.add(game)
+        try:
+            with self._network_slots:
+                snapshot = self._build_game(game)
+        except Exception:
+            # Autocomplete must never surface a network/parser failure through
+            # the Discord gateway. Keep any last good snapshot below.
+            snapshot = CatalogSnapshot((), False)
+        finally:
+            with self._lock:
+                self._building.discard(game)
+        with self._lock:
+            if snapshot.sets:
+                self._snapshots[game] = snapshot
+                # Partial snapshots are useful and safe (they only offer
+                # catalog-confirmed choices), so serve them while later
+                # autocomplete calls advance the missing group batches.
+                self._until[game] = time.monotonic() + CATALOG_TTL
+                self._next_batch_at[game] = (
+                    float("inf") if snapshot.complete else time.monotonic()
+                )
+                return True
+            # A failure does not erase the last known-good snapshot, but does
+            # stop a burst of autocomplete calls from repeatedly hitting TCGCSV.
+            made_progress = bool(self._products.get(game))
+            self._next_batch_at[game] = time.monotonic() + (
+                0 if made_progress else CATALOG_RETRY_TTL
+            )
+            return game in self._snapshots
+
+    def _build_game(self, game: str) -> CatalogSnapshot:
+        category = TCGCSV_CATEGORY[game]
+        base = f"https://tcgcsv.com/tcgplayer/{category}"
+        now = time.monotonic()
+        with self._lock:
+            valid_groups = self._groups.get(game, ())
+            groups_expired = now >= self._groups_until.get(game, 0)
+        if not valid_groups or groups_expired:
+            try:
+                response = requests.get(
+                    f"{base}/groups", headers=_HTTP_HEADERS, timeout=4
+                )
+                response.raise_for_status()
+                groups = response.json().get("results", [])
+            except (requests.RequestException, ValueError, AttributeError):
+                with self._lock:
+                    previous = self._snapshots.get(game)
+                return previous or CatalogSnapshot((), False)
+            valid_groups = tuple(
+                group for group in groups
+                if group.get("groupId") is not None
+                and str(group.get("name") or "").strip()
+            )
+            with self._lock:
+                # Retain completed product rows that still belong to a current
+                # group. This avoids re-downloading a whole category on TTL
+                # refresh and keeps progress across partial batches.
+                allowed = {int(group["groupId"]) for group in valid_groups}
+                old = self._products.get(game, {})
+                self._products[game] = {
+                    group_id: products for group_id, products in old.items()
+                    if group_id in allowed
+                }
+                self._products_until[game] = {
+                    group_id: expiry for group_id, expiry
+                    in self._products_until.get(game, {}).items()
+                    if group_id in allowed
+                }
+                self._failed_until[game] = {
+                    group_id: retry for group_id, retry
+                    in self._failed_until.get(game, {}).items()
+                    if group_id in allowed
+                }
+                self._groups[game] = valid_groups
+                self._groups_until[game] = time.monotonic() + CATALOG_TTL
+
+        with self._lock:
+            products_by_group = self._products.setdefault(game, {})
+            products_until = self._products_until.setdefault(game, {})
+            failed_until = self._failed_until.setdefault(game, {})
+            now = time.monotonic()
+            missing = [
+                group for group in valid_groups
+                if (int(group["groupId"]) not in products_by_group
+                    or now >= products_until.get(int(group["groupId"]), 0))
+                and now >= failed_until.get(int(group["groupId"]), 0)
+            ]
+            missing.sort(
+                key=lambda group: (
+                    int(group["groupId"]) in failed_until,
+                    int(group["groupId"]),
+                )
+            )
+        # Work only an incremental batch. Failed groups are retried after their
+        # short backoff, while untouched groups stay ahead of them so one
+        # transient outage cannot starve every later set.
+        batch = missing[:CATALOG_BATCH_SIZE]
+        if not batch:
+            with self._lock:
+                product_rows = dict(self._products.get(game, {}))
+                product_expiry = dict(self._products_until.get(game, {}))
+            return self._snapshot_from_products(
+                game, valid_groups, product_rows, product_expiry
+            )
+
+        deadline = time.monotonic() + CATALOG_BUILD_BUDGET
+        results: list[tuple[dict, list[CatalogProduct] | None]] = []
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=CATALOG_WORKERS)
+        future_groups = {
+            pool.submit(self._fetch_products, base, group, game): group
+            for group in batch
+        }
+        futures = list(future_groups)
+        try:
+            for future in concurrent.futures.as_completed(
+                futures, timeout=max(0.01, deadline - time.monotonic())
+            ):
+                group, products = future.result()
+                results.append((group, products))
+        except concurrent.futures.TimeoutError:
+            pass
+        finally:
+            for future in futures:
+                future.cancel()
+            # Do not wait for socket timeouts after the autocomplete budget.
+            pool.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            saved = self._products.setdefault(game, {})
+            expiries = self._products_until.setdefault(game, {})
+            failures = self._failed_until.setdefault(game, {})
+            completed_ids = {int(group["groupId"]) for group, _ in results}
+            for group, products in results:
+                group_id = int(group["groupId"])
+                if products is None:
+                    failures[group_id] = time.monotonic() + CATALOG_RETRY_TTL
+                else:
+                    # Empty is a successful response and must not be repeatedly
+                    # fetched as though it were a network failure.
+                    saved[group_id] = tuple(products)
+                    expiries[group_id] = time.monotonic() + CATALOG_TTL
+                    failures.pop(group_id, None)
+            # Futures that exceeded the batch deadline are retryable failures,
+            # not empty sets. Marking them lets subsequent calls progress to
+            # later untouched groups instead of restarting the same slow batch.
+            for future, group in future_groups.items():
+                group_id = int(group["groupId"])
+                if group_id not in completed_ids:
+                    failures[group_id] = time.monotonic() + CATALOG_RETRY_TTL
+            product_rows = dict(saved)
+            product_expiry = dict(expiries)
+        return self._snapshot_from_products(
+            game, valid_groups, product_rows, product_expiry
+        )
+
+    @staticmethod
+    def _snapshot_from_products(
+        game: str, groups: tuple[dict, ...],
+        products_by_group: dict[int, tuple[CatalogProduct, ...]],
+        products_until: dict[int, float],
+    ) -> CatalogSnapshot:
+        now = time.monotonic()
+        abbreviation_counts: dict[str, int] = {}
+        for group in groups:
+            abbreviation = normalize_catalog_text(str(group.get("abbreviation") or ""))
+            if abbreviation:
+                abbreviation_counts[abbreviation] = (
+                    abbreviation_counts.get(abbreviation, 0) + 1
+                )
+        sets = tuple(
+            CatalogSet(
+                game=game,
+                group_id=int(group["groupId"]),
+                name=str(group["name"]).strip(),
+                abbreviation=(str(group["abbreviation"]).strip() or None)
+                if group.get("abbreviation") is not None else None,
+                products=products_by_group[int(group["groupId"])],
+                abbreviation_unique=(
+                    game != "yugioh"
+                    and bool(normalize_catalog_text(
+                        str(group.get("abbreviation") or "")
+                    ))
+                    and abbreviation_counts[
+                        normalize_catalog_text(
+                            str(group.get("abbreviation") or "")
+                        )
+                    ] == 1
+                ),
+            )
+            for group in groups
+            if (products_by_group.get(int(group["groupId"]))
+                and now < products_until.get(int(group["groupId"]), 0))
+        )
+        return CatalogSnapshot(
+            sets,
+            all(
+                group_id in products_by_group
+                and now < products_until.get(group_id, 0)
+                for group_id in (int(group["groupId"]) for group in groups)
+            ),
+        )
+
+    @staticmethod
+    def _fetch_products(
+        base: str, group: dict, game: str
+    ) -> tuple[dict, list[CatalogProduct] | None]:
+        try:
+            response = requests.get(
+                f"{base}/{group['groupId']}/products",
+                headers=_HTTP_HEADERS,
+                timeout=4,
+            )
+            response.raise_for_status()
+            raw_products = response.json().get("results", [])
+        except (requests.RequestException, ValueError, AttributeError):
+            # None is deliberately distinct from a verified empty group; the
+            # latter is cached while the former is retried in a later batch.
+            return group, None
+        products = []
+        for product in raw_products:
+            name = str(product.get("name") or "").strip()
+            if not name:
+                continue
+            extended = product.get("extendedData") or []
+            rarity = next(
+                (
+                    str(entry.get("value") or "").strip()
+                    for entry in extended
+                    if str(entry.get("name") or "").casefold() == "rarity"
+                    and str(entry.get("value") or "").strip()
+                ),
+                None,
+            )
+            # Product-only set entries do not represent a card name and should
+            # never make a set appear in card autocomplete results.
+            has_card_number = any(
+                str(entry.get("name") or "").casefold() == "number"
+                for entry in extended
+            )
+            if has_card_number or rarity:
+                products.append(CatalogProduct(
+                    name=name,
+                    rarity=canonical_rarity(game, rarity) if rarity else None,
+                ))
+        return group, products
+
+    def matching_sets(self, card_name: str, game: str | None = None) -> list[CatalogSet] | None:
+        """Return matching catalog sets, or None while one needed cache is cold."""
+        wanted = normalize_catalog_text(card_name)
+        games = (game,) if game else GAMES
+        if not wanted or any(not self.is_ready(candidate) for candidate in games):
+            return None
+        matches: list[CatalogSet] = []
+        with self._lock:
+            snapshots = [self._snapshots.get(candidate) for candidate in games]
+        for snapshot in snapshots:
+            if snapshot is None:
+                continue
+            for card_set in snapshot.sets:
+                if any(
+                    contains_catalog_phrase(product.name, wanted)
+                    for product in card_set.products
+                ):
+                    matches.append(card_set)
+        return sorted(matches, key=lambda item: (GAME_LABELS[item.game], item.name))
+
+    def rarities(self, card_name: str, set_token: str) -> list[str] | None:
+        """Return rarities for exactly the card + selected catalog set."""
+        card_set = self.resolve_set(set_token)
+        if card_set is None:
+            return [] if self._known_token(set_token) else None
+        wanted = normalize_catalog_text(card_name)
+        return sorted({
+            product.rarity
+            for product in card_set.products
+            if product.rarity and contains_catalog_phrase(product.name, wanted)
+        }, key=str.casefold)
+
+    def resolve_set(self, set_token: str) -> CatalogSet | None:
+        try:
+            game, raw_id = set_token.split(":", 1)
+            group_id = int(raw_id)
+        except (ValueError, AttributeError):
+            return None
+        if game not in GAMES or not self.is_ready(game):
+            return None
+        with self._lock:
+            snapshot = self._snapshots.get(game)
+        return next(
+            (entry for entry in (snapshot.sets if snapshot else ())
+             if entry.group_id == group_id),
+            None,
+        )
+
+    def _known_token(self, set_token: str) -> bool:
+        try:
+            game, _raw_id = set_token.split(":", 1)
+        except (ValueError, AttributeError):
+            return False
+        return game in GAMES and self.is_ready(game)
+
+    def validate(
+        self,
+        card_name: str,
+        game: str | None,
+        set_token: str | None,
+        rarity: str | None,
+    ) -> tuple[CatalogSet | None, str | None, str | None]:
+        """Validate selections against the cache.
+
+        Returns (set, rarity, error).  No free-form set or rarity is accepted.
+        """
+        if game is not None and game not in GAMES:
+            return None, None, "Choose a game from the provided list."
+        if rarity and not set_token:
+            return None, None, "Choose a set before choosing a rarity."
+        if not set_token:
+            return None, None, None
+        card_set = self.resolve_set(set_token)
+        if card_set is None:
+            return None, None, (
+                "That set is not a current catalog selection. Please choose it "
+                "from autocomplete after the catalog finishes loading."
+            )
+        if game and card_set.game != game:
+            return None, None, "The selected set belongs to a different game."
+        matching_sets = self.matching_sets(card_name, card_set.game)
+        if matching_sets is None:
+            return None, None, "The card catalog is still loading. Please try again shortly."
+        if card_set not in matching_sets:
+            return None, None, "That set does not contain the entered card name."
+        if rarity:
+            scoped_rarities = self.rarities(card_name, set_token)
+            if scoped_rarities is None or rarity not in scoped_rarities:
+                return None, None, (
+                    "That rarity is not available for this card in the selected set."
+                )
+        return card_set, rarity, None

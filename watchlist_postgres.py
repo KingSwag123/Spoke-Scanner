@@ -11,7 +11,14 @@ from typing import Iterable
 import psycopg
 from psycopg.rows import dict_row
 
-from watchlist_bot import PendingDM, Watch, WatchlistStore, _normalize_term
+from watchlist_bot import (
+    PendingDM,
+    Watch,
+    WatchlistStore,
+    _listing_matches_watch_filters,
+    _normalize_term,
+    _watch_accepts_listing,
+)
 
 
 class PostgresWatchlistStore:
@@ -24,21 +31,78 @@ class PostgresWatchlistStore:
     def _connect():
         return psycopg.connect(row_factory=dict_row, connect_timeout=10)
 
-    def upsert_watch(self, user_id: int, item_name: str, max_price: float) -> None:
+    def upsert_watch(
+        self, user_id: int, item_name: str, max_price: float,
+        game: str | None = None, set_name: str | None = None,
+        set_code: str | None = None, rarity: str | None = None,
+    ) -> None:
         normalized = _normalize_term(item_name)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO watchlists
-                    (user_id, item_name, normalized_name, max_price)
-                VALUES (%s, %s, %s, %s)
+                    (user_id, item_name, normalized_name, max_price, game,
+                     set_name, set_code, rarity)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id, normalized_name) DO UPDATE SET
                     item_name = EXCLUDED.item_name,
                     max_price = EXCLUDED.max_price,
+                    game = EXCLUDED.game,
+                    set_name = EXCLUDED.set_name,
+                    set_code = EXCLUDED.set_code,
+                    rarity = EXCLUDED.rarity,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (user_id, item_name.strip(), normalized, max_price),
+                (user_id, item_name.strip(), normalized, max_price, game,
+                 set_name, set_code, rarity),
             )
+            # Replace/re-evaluate any queued alert for this phrase in the same
+            # transaction as the upsert so an old filter cannot leak a DM.
+            replacement = Watch(
+                id=0, user_id=user_id, item_name=item_name.strip(),
+                normalized_name=normalized, max_price=max_price, game=game,
+                set_name=set_name, set_code=set_code, rarity=rarity,
+            )
+            pending = conn.execute(
+                """
+                DELETE FROM pending_watch_dms
+                WHERE user_id = %s AND normalized_name = %s
+                RETURNING item_id, payload
+                """,
+                (user_id, normalized),
+            ).fetchall()
+            for alert in pending:
+                try:
+                    item = json.loads(alert["payload"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not _watch_accepts_listing(replacement, item):
+                    continue
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{user_id}:{alert['item_id']}",),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO pending_watch_dms
+                        (user_id, item_id, item_name, normalized_name, max_price,
+                         game, set_name, set_code, rarity, payload)
+                    SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM watchlist_deliveries
+                        WHERE user_id = %s AND item_id = %s
+                    )
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        user_id, alert["item_id"], replacement.item_name,
+                        replacement.normalized_name, replacement.max_price,
+                        replacement.game, replacement.set_name,
+                        replacement.set_code, replacement.rarity,
+                        json.dumps(item, ensure_ascii=False),
+                        user_id, alert["item_id"],
+                    ),
+                )
 
     @staticmethod
     def _to_watches(rows) -> list[Watch]:
@@ -49,6 +113,10 @@ class PostgresWatchlistStore:
                 item_name=row["item_name"],
                 normalized_name=row["normalized_name"],
                 max_price=float(row["max_price"]),
+                game=row["game"],
+                set_name=row["set_name"],
+                set_code=row["set_code"],
+                rarity=row["rarity"],
             )
             for row in rows
         ]
@@ -56,7 +124,8 @@ class PostgresWatchlistStore:
     def list_watches(self) -> list[Watch]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, user_id, item_name, normalized_name, max_price "
+                "SELECT id, user_id, item_name, normalized_name, max_price, "
+                "game, set_name, set_code, rarity "
                 "FROM watchlists"
             ).fetchall()
         return self._to_watches(rows)
@@ -65,7 +134,8 @@ class PostgresWatchlistStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, user_id, item_name, normalized_name, max_price
+                SELECT id, user_id, item_name, normalized_name, max_price,
+                       game, set_name, set_code, rarity
                 FROM watchlists
                 WHERE user_id = %s
                 ORDER BY normalized_name
@@ -133,7 +203,8 @@ class PostgresWatchlistStore:
                 matching_by_user: dict[int, Watch] = {}
                 for watch in watches:
                     if (f" {watch.normalized_name} " not in bounded_title
-                            or total > watch.max_price):
+                            or total > watch.max_price
+                            or not _listing_matches_watch_filters(watch, item, title)):
                         continue
                     previous = matching_by_user.get(watch.user_id)
                     if (previous is None
@@ -150,8 +221,9 @@ class PostgresWatchlistStore:
                         """
                         INSERT INTO pending_watch_dms
                             (user_id, item_id, item_name, normalized_name,
-                             max_price, payload)
-                        SELECT %s, %s, %s, %s, %s, %s
+                              max_price, game, set_name, set_code, rarity,
+                              payload)
+                        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         WHERE NOT EXISTS (
                             SELECT 1 FROM watchlist_deliveries
                             WHERE user_id = %s AND item_id = %s
@@ -164,6 +236,10 @@ class PostgresWatchlistStore:
                             watch.item_name,
                             watch.normalized_name,
                             watch.max_price,
+                            watch.game,
+                            watch.set_name,
+                            watch.set_code,
+                            watch.rarity,
                             json.dumps(item, ensure_ascii=False),
                             watch.user_id,
                             item_id,
@@ -195,7 +271,9 @@ class PostgresWatchlistStore:
                 WHERE pending.user_id = ready.user_id
                   AND pending.item_id = ready.item_id
                 RETURNING pending.user_id, pending.item_id, pending.item_name,
-                          pending.max_price, pending.payload, pending.attempts
+                          pending.max_price, pending.game, pending.set_name,
+                          pending.set_code, pending.rarity, pending.payload,
+                          pending.attempts
                 """,
                 (limit, self.claim_token),
             ).fetchall()
@@ -214,9 +292,32 @@ class PostgresWatchlistStore:
                     max_price=float(row["max_price"]),
                     payload=payload,
                     attempts=row["attempts"],
+                    game=row["game"],
+                    set_name=row["set_name"],
+                    set_code=row["set_code"],
+                    rarity=row["rarity"],
                 )
             )
         return pending
+
+    def pending_is_current(self, alert: PendingDM) -> bool:
+        """Confirm this worker still owns the unchanged queued alert."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT item_name, max_price, game, set_name, set_code, rarity
+                FROM pending_watch_dms
+                WHERE user_id = %s AND item_id = %s AND claim_token = %s
+                """,
+                (alert.user_id, alert.item_id, self.claim_token),
+            ).fetchone()
+        return row is not None and (
+            row["item_name"], float(row["max_price"]), row["game"],
+            row["set_name"], row["set_code"], row["rarity"],
+        ) == (
+            alert.item_name, float(alert.max_price), alert.game,
+            alert.set_name, alert.set_code, alert.rarity,
+        )
 
     def complete(self, user_id: int, item_id: str) -> None:
         with self._connect() as conn:
@@ -281,8 +382,8 @@ class PostgresWatchlistStore:
             ).fetchall()
             pending = old.execute(
                 """
-                SELECT user_id, item_id, item_name, max_price, payload,
-                       attempts, next_attempt, created_at
+                SELECT user_id, item_id, item_name, max_price, game, set_name,
+                       set_code, rarity, payload, attempts, next_attempt, created_at
                 FROM pending_watch_dms
                 """
             ).fetchall()
@@ -294,8 +395,9 @@ class PostgresWatchlistStore:
                 result = conn.execute(
                     """
                     INSERT INTO watchlists
-                        (user_id, item_name, normalized_name, max_price)
-                    VALUES (%s, %s, %s, %s)
+                        (user_id, item_name, normalized_name, max_price, game,
+                         set_name, set_code, rarity)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (user_id, normalized_name) DO NOTHING
                     """,
                     (
@@ -303,6 +405,10 @@ class PostgresWatchlistStore:
                         watch.item_name,
                         watch.normalized_name,
                         watch.max_price,
+                        watch.game,
+                        watch.set_name,
+                        watch.set_code,
+                        watch.rarity,
                     ),
                 )
                 imported_watches += result.rowcount
@@ -331,9 +437,10 @@ class PostgresWatchlistStore:
                     """
                     INSERT INTO pending_watch_dms
                         (user_id, item_id, item_name, normalized_name,
-                         max_price, payload, attempts, next_attempt, created_at)
-                    SELECT %s, %s, %s, %s, %s, %s, %s,
-                           to_timestamp(%s), %s
+                             max_price, game, set_name, set_code, rarity,
+                             payload, attempts, next_attempt, created_at)
+                        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               to_timestamp(%s), %s
                     WHERE NOT EXISTS (
                         SELECT 1 FROM watchlist_deliveries
                         WHERE user_id = %s AND item_id = %s
@@ -346,6 +453,10 @@ class PostgresWatchlistStore:
                         alert["item_name"],
                         normalized,
                         alert["max_price"],
+                        alert["game"],
+                        alert["set_name"],
+                        alert["set_code"],
+                        alert["rarity"],
                         alert["payload"],
                         alert["attempts"],
                         alert["next_attempt"],
