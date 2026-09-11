@@ -20,3 +20,11 @@ description: How the Mercari JP and US lanes work, what's blocked, and the pokem
 - mercari.com's __NEXT_DATA__ script tag carries extra attributes (crossorigin) — match with [^>]*, and the blob contains NO item data (results fetched client-side). Parse the rendered DOM cards instead: data-productid="m…", img alt = title (HTML-escaped, unescape; suffixed " - <brand>"), $X.XX price in dollars, srcset first URL for image. JSON walker kept as primary in case they revert.
 - **Health rule:** if a page loads but no listing format is recognized, fail closed and stop that sweep immediately; while unhealthy, spend only one recovery-probe request every 10 minutes, then automatically resume normal full sweeps after a valid parse.
 - **Why:** all configured queries share Mercari's page format, so running the remaining searches after one parser failure only wastes metered Scrapfly credits and cannot yield safe alerts.
+
+## Personal watch verification
+
+Personal price-limit watches must not reuse the public lane's assumed shipping.
+
+**Why:** On 2026-09-11, rendered targeted searches returned real cards and purchasable detail pages, but the inspected primary product regions did not expose attributable shipping. Counting these as verified under-budget matches would be misleading.
+
+**How to apply:** Require price and shipping attributable to the requested item, exclude recommendations as evidence, and explain partial checks when shipping is unavailable. A successful search page is not proof that the full alert-verification path works.

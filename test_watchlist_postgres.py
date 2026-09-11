@@ -36,6 +36,10 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
                 "DELETE FROM watchlists WHERE user_id = %s",
                 (self.user_id,),
             )
+            conn.execute(
+                "DELETE FROM watchlist_dm_pacing WHERE user_id = %s",
+                (self.user_id,),
+            )
 
     @staticmethod
     def listing(item_id: str) -> dict:
@@ -196,6 +200,76 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
                 for alert in recovered
             )
         )
+
+    def test_digest_claim_is_multiworker_safe_and_retry_releases_lease(self):
+        self.store.upsert_watch(self.user_id, "Pikachu V", 30)
+        watch = self.store.list_watches_for_user(self.user_id)[0]
+        self.store.enqueue_watch_matches(watch, [
+            {**self.listing(f"digest-a-{self.user_id}"), "price": 22},
+            {**self.listing(f"digest-b-{self.user_id}"), "price": 20},
+        ])
+        other_worker = PostgresWatchlistStore()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            own_future = pool.submit(self.store.claim_digest_batches)
+            other_future = pool.submit(other_worker.claim_digest_batches)
+            own, other = own_future.result(), other_future.result()
+        # Exactly one worker owns this user's paced digest; the two listings
+        # remain together and cheapest-first.
+        self.assertEqual(sum(len(batch) for batch in own + other), 2)
+        claimed = (own or other)[0]
+        self.assertEqual([entry.item_id for entry in claimed], [
+            f"digest-b-{self.user_id}", f"digest-a-{self.user_id}",
+        ])
+        owner = self.store if own else other_worker
+        for entry in claimed:
+            owner.retry_later(entry.user_id, entry.item_id, entry.attempts)
+        # Retry retains the listing but waits for the persisted user pace.  For
+        # this fixture, advance only that pacing record instead of sleeping.
+        with psycopg.connect() as conn:
+            conn.execute(
+                """
+                UPDATE watchlist_dm_pacing
+                SET next_digest_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
+                WHERE user_id = %s
+                """, (self.user_id,),
+            )
+            conn.execute(
+                """
+                UPDATE pending_watch_dms
+                SET next_attempt = CURRENT_TIMESTAMP - INTERVAL '1 second'
+                WHERE user_id = %s
+                """, (self.user_id,),
+            )
+        retried = owner.claim_digest_batches()
+        self.assertEqual([entry.item_id for entry in retried[0]], [
+            f"digest-b-{self.user_id}", f"digest-a-{self.user_id}",
+        ])
+
+    def test_targeted_search_job_lease_is_invalidated_by_watch_update(self):
+        self.store.upsert_watch(self.user_id, "Pikachu V", 30)
+        with psycopg.connect() as conn:
+            conn.execute(
+                """
+                UPDATE watch_targeted_search_jobs
+                SET next_attempt = CURRENT_TIMESTAMP - INTERVAL '1 second'
+                WHERE user_id = %s AND normalized_name = 'pikachu v'
+                """, (self.user_id,),
+            )
+        old_watch = self.store.claim_targeted_searches()[0]
+        self.store.upsert_watch(self.user_id, "Pikachu V", 20)
+        # The stale owner cannot turn an updated watch's next run into an
+        # immediate request; only its current claim token may finish a job.
+        self.store.finish_targeted_search(old_watch, delay=0)
+        with psycopg.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT next_attempt, claim_token
+                FROM watch_targeted_search_jobs
+                WHERE user_id = %s AND normalized_name = 'pikachu v'
+                """, (self.user_id,),
+            ).fetchone()
+        self.assertIsNone(row[1])
+        self.assertEqual(self.store.claim_targeted_searches(), [])
 
     def test_imports_legacy_watches_deliveries_and_pending_alerts(self):
         delivered_id = f"delivered-{self.user_id}"

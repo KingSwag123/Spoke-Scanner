@@ -86,8 +86,8 @@ class PostgresWatchlistStore:
                     """
                     INSERT INTO pending_watch_dms
                         (user_id, item_id, item_name, normalized_name, max_price,
-                         game, set_name, set_code, rarity, payload)
-                    SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                         game, set_name, set_code, rarity, payload, total_price)
+                    SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     WHERE NOT EXISTS (
                         SELECT 1 FROM watchlist_deliveries
                         WHERE user_id = %s AND item_id = %s
@@ -100,9 +100,26 @@ class PostgresWatchlistStore:
                         replacement.game, replacement.set_name,
                         replacement.set_code, replacement.rarity,
                         json.dumps(item, ensure_ascii=False),
+                        float(item.get("price", 0)) + float(item.get("shipping", 0)),
                         user_id, alert["item_id"],
                     ),
                 )
+            # /watch performs an immediate search, then this durable fair job
+            # retries its watch on the next interval even across restarts.
+            conn.execute(
+                """
+                INSERT INTO watch_targeted_search_jobs
+                    (user_id, normalized_name, next_attempt, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP + INTERVAL '120 seconds',
+                        CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id, normalized_name) DO UPDATE SET
+                    next_attempt = EXCLUDED.next_attempt,
+                    claim_token = NULL,
+                    in_flight_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, normalized),
+            )
 
     @staticmethod
     def _to_watches(rows) -> list[Watch]:
@@ -159,6 +176,11 @@ class PostgresWatchlistStore:
                 return None
             conn.execute(
                 "DELETE FROM pending_watch_dms "
+                "WHERE user_id = %s AND normalized_name = %s",
+                (user_id, normalized),
+            )
+            conn.execute(
+                "DELETE FROM watch_targeted_search_jobs "
                 "WHERE user_id = %s AND normalized_name = %s",
                 (user_id, normalized),
             )
@@ -222,8 +244,8 @@ class PostgresWatchlistStore:
                         INSERT INTO pending_watch_dms
                             (user_id, item_id, item_name, normalized_name,
                               max_price, game, set_name, set_code, rarity,
-                              payload)
-                        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                               payload, total_price)
+                        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         WHERE NOT EXISTS (
                             SELECT 1 FROM watchlist_deliveries
                             WHERE user_id = %s AND item_id = %s
@@ -241,11 +263,69 @@ class PostgresWatchlistStore:
                             watch.set_code,
                             watch.rarity,
                             json.dumps(item, ensure_ascii=False),
+                            total,
                             watch.user_id,
                             item_id,
                         ),
                     )
                     queued += result.rowcount
+        return queued
+
+    def enqueue_watch_matches(
+        self, watch: Watch, listings: Iterable[dict], limit: int | None = None,
+        initial: bool = False,
+    ) -> int:
+        candidates = [
+            (float(item.get("price", 0)) + float(item.get("shipping", 0)), item)
+            for item in listings if _watch_accepts_listing(watch, item)
+        ]
+        candidates.sort(key=lambda pair: (pair[0], str(pair[1].get("item_id") or "")))
+        if limit is not None:
+            candidates = candidates[:limit]
+        queued = 0
+        with self._connect() as conn:
+            current = conn.execute(
+                """
+                SELECT item_name, max_price, game, set_name, set_code, rarity
+                FROM watchlists
+                WHERE user_id = %s AND normalized_name = %s
+                FOR UPDATE
+                """, (watch.user_id, watch.normalized_name),
+            ).fetchone()
+            if current is None or (
+                current["item_name"], float(current["max_price"]), current["game"],
+                current["set_name"], current["set_code"], current["rarity"],
+            ) != (
+                watch.item_name, float(watch.max_price), watch.game,
+                watch.set_name, watch.set_code, watch.rarity,
+            ):
+                return 0
+            for position, (total, item) in enumerate(candidates):
+                item_id = str(item.get("item_id") or "")
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{watch.user_id}:{item_id}",),
+                )
+                result = conn.execute(
+                    """
+                    INSERT INTO pending_watch_dms
+                        (user_id, item_id, item_name, normalized_name, max_price,
+                         game, set_name, set_code, rarity, payload, total_price,
+                         initial_batch)
+                    SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM watchlist_deliveries
+                        WHERE user_id = %s AND item_id = %s
+                    )
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (watch.user_id, item_id, watch.item_name, watch.normalized_name,
+                     watch.max_price, watch.game, watch.set_name, watch.set_code,
+                     watch.rarity, json.dumps(item, ensure_ascii=False), total,
+                     initial and position < 3,
+                     watch.user_id, item_id),
+                )
+                queued += result.rowcount
         return queued
 
     def pending(self, limit: int = 100) -> list[PendingDM]:
@@ -368,6 +448,177 @@ class PostgresWatchlistStore:
             ).fetchone()
         return int(row["count"])
 
+    def reserve_mercari_daily(self, cap: int, requests: int) -> bool:
+        """Atomically reserve a metered personal-lane request allowance."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO watch_source_daily_budgets
+                    (source, budget_day, used_requests)
+                VALUES ('mercari', CURRENT_DATE, %s)
+                ON CONFLICT (source) DO UPDATE SET
+                    budget_day = CURRENT_DATE,
+                    used_requests = CASE
+                        WHEN watch_source_daily_budgets.budget_day = CURRENT_DATE
+                        THEN watch_source_daily_budgets.used_requests
+                             + EXCLUDED.used_requests
+                        ELSE EXCLUDED.used_requests
+                    END
+                WHERE watch_source_daily_budgets.budget_day <> CURRENT_DATE
+                   OR watch_source_daily_budgets.used_requests
+                      + EXCLUDED.used_requests <= %s
+                RETURNING used_requests
+                """,
+                (requests, cap),
+            ).fetchone()
+        return row is not None
+
+    def mercari_daily_remaining(self, cap: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT CASE WHEN budget_day = CURRENT_DATE
+                            THEN used_requests ELSE 0 END AS used_requests
+                FROM watch_source_daily_budgets WHERE source = 'mercari'
+                """
+            ).fetchone()
+        used = int(row["used_requests"]) if row else 0
+        return max(0, cap - used)
+
+    def claim_targeted_searches(self, limit: int = 1) -> list[Watch]:
+        """Lock and lease due watch searches, preserving FIFO fairness."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT w.id, w.user_id, w.item_name, w.normalized_name, w.max_price,
+                       w.game, w.set_name, w.set_code, w.rarity
+                FROM watch_targeted_search_jobs job
+                JOIN watchlists w ON w.user_id = job.user_id
+                               AND w.normalized_name = job.normalized_name
+                WHERE job.next_attempt <= CURRENT_TIMESTAMP
+                  AND (job.in_flight_until IS NULL
+                       OR job.in_flight_until <= CURRENT_TIMESTAMP)
+                ORDER BY job.next_attempt, job.created_at, job.user_id, job.normalized_name
+                FOR UPDATE OF job SKIP LOCKED
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE watch_targeted_search_jobs
+                    SET claim_token = %s,
+                        in_flight_until = CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+                    WHERE user_id = %s AND normalized_name = %s
+                    """,
+                    (self.claim_token, row["user_id"], row["normalized_name"]),
+                )
+        return self._to_watches(rows)
+
+    def finish_targeted_search(self, watch: Watch, delay: float = 120.0) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE watch_targeted_search_jobs
+                SET next_attempt = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                    claim_token = NULL, in_flight_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = %s AND normalized_name = %s AND claim_token = %s
+                """,
+                (delay, watch.user_id, watch.normalized_name, self.claim_token),
+            )
+
+    def claim_digest_batches(
+        self, user_limit: int = 20, per_user: int = 5, interval: float = 120.0,
+    ) -> list[list[PendingDM]]:
+        """Claim at most one paced, cheapest-first digest per user."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                WITH candidate_users AS (
+                    SELECT p.user_id
+                    FROM pending_watch_dms p
+                    LEFT JOIN watchlist_dm_pacing pace ON pace.user_id = p.user_id
+                    WHERE p.next_attempt <= CURRENT_TIMESTAMP
+                      AND (p.in_flight_until IS NULL
+                           OR p.in_flight_until <= CURRENT_TIMESTAMP)
+                      AND COALESCE(pace.next_digest_at, CURRENT_TIMESTAMP)
+                          <= CURRENT_TIMESTAMP
+                    GROUP BY p.user_id, pace.last_digest_at
+                    ORDER BY COALESCE(pace.last_digest_at, to_timestamp(0)),
+                             MIN(p.created_at), p.user_id
+                    LIMIT %s
+                ), eligible_users AS (
+                    SELECT user_id
+                    FROM candidate_users
+                    WHERE pg_try_advisory_xact_lock(
+                        hashtextextended('watch-digest:' || user_id::text, 0)
+                    )
+                    LIMIT %s
+                ), ranked AS (
+                    SELECT p.user_id, p.item_id, p.initial_batch,
+                           BOOL_OR(p.initial_batch) OVER (
+                               PARTITION BY p.user_id
+                           ) AS has_initial,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY p.user_id
+                               ORDER BY p.initial_batch DESC, p.total_price,
+                                        p.created_at, p.item_id
+                           ) AS position
+                    FROM pending_watch_dms p
+                    JOIN eligible_users u ON u.user_id = p.user_id
+                    WHERE p.next_attempt <= CURRENT_TIMESTAMP
+                      AND (p.in_flight_until IS NULL
+                           OR p.in_flight_until <= CURRENT_TIMESTAMP)
+                ), claimed AS (
+                    UPDATE pending_watch_dms p
+                    SET claim_token = %s,
+                        in_flight_until = CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+                    FROM ranked r
+                    WHERE p.user_id = r.user_id AND p.item_id = r.item_id
+                      AND (NOT r.has_initial OR r.initial_batch)
+                      AND r.position <= CASE WHEN r.has_initial THEN 3 ELSE %s END
+                      AND (p.in_flight_until IS NULL
+                           OR p.in_flight_until <= CURRENT_TIMESTAMP)
+                      AND p.next_attempt <= CURRENT_TIMESTAMP
+                    RETURNING p.user_id, p.item_id, p.item_name, p.max_price,
+                              p.game, p.set_name, p.set_code, p.rarity,
+                              p.payload, p.attempts, p.total_price
+                ), paced AS (
+                    INSERT INTO watchlist_dm_pacing
+                        (user_id, next_digest_at, last_digest_at)
+                    SELECT DISTINCT user_id,
+                        CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                        CURRENT_TIMESTAMP
+                    FROM claimed
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        next_digest_at = EXCLUDED.next_digest_at,
+                        last_digest_at = EXCLUDED.last_digest_at
+                    RETURNING user_id
+                )
+                SELECT * FROM claimed ORDER BY user_id, total_price, item_id
+                """,
+                (user_limit * 4, user_limit, self.claim_token, per_user, interval),
+            ).fetchall()
+        batches: dict[int, list[PendingDM]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                # This worker owns the corrupt item; leave completion to the
+                # normal terminal path rather than retrying malformed payloads.
+                self.complete(row["user_id"], row["item_id"])
+                continue
+            batches.setdefault(row["user_id"], []).append(PendingDM(
+                user_id=row["user_id"], item_id=row["item_id"],
+                item_name=row["item_name"], max_price=float(row["max_price"]),
+                payload=payload, attempts=row["attempts"], game=row["game"],
+                set_name=row["set_name"], set_code=row["set_code"],
+                rarity=row["rarity"],
+            ))
+        return list(batches.values())
+
     def import_sqlite(self, db_path: str) -> tuple[int, int, int]:
         """Import legacy data if the deployment's SQLite file still exists."""
         if not os.path.isfile(db_path):
@@ -438,9 +689,9 @@ class PostgresWatchlistStore:
                     INSERT INTO pending_watch_dms
                         (user_id, item_id, item_name, normalized_name,
                              max_price, game, set_name, set_code, rarity,
-                             payload, attempts, next_attempt, created_at)
+                              payload, total_price, attempts, next_attempt, created_at)
                         SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                               to_timestamp(%s), %s
+                               %s, to_timestamp(%s), %s
                     WHERE NOT EXISTS (
                         SELECT 1 FROM watchlist_deliveries
                         WHERE user_id = %s AND item_id = %s
@@ -458,6 +709,7 @@ class PostgresWatchlistStore:
                         alert["set_code"],
                         alert["rarity"],
                         alert["payload"],
+                        0,
                         alert["attempts"],
                         alert["next_attempt"],
                         alert["created_at"],

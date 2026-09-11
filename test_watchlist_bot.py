@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -17,15 +19,24 @@ from tcgcsv_catalog import (
     rarity_matches_title,
 )
 from watchlist_bot import (
+    PendingDM,
     Watch,
     WatchlistBot,
     WatchlistStore,
     _listing_matches_watch_filters,
     _unsupported_game_name,
 )
+from watch_search import MERCARI_DAILY_PERSONAL_REQUEST_CAP, TargetedWatchSearch
 
 
 class WatchlistStoreTests(unittest.TestCase):
+    def test_explicit_rarity_cannot_be_overridden_by_title(self):
+        watch = Watch(1, 1, "Exodia", "exodia", 50, "yugioh", rarity="Rare")
+        listing = {"game_name": "yugioh", "rarity": "Ultra Rare"}
+        self.assertFalse(_listing_matches_watch_filters(watch, listing, "Exodia Rare"))
+        listing["rarity"] = "Rare"
+        self.assertTrue(_listing_matches_watch_filters(watch, listing, "Exodia"))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmp.name) / "watchlists.db")
@@ -205,6 +216,144 @@ class WatchlistStoreTests(unittest.TestCase):
             }]
         )
         self.assertEqual(queued, 1)
+
+    def test_initial_digest_claim_is_three_cheapest_and_pacing_is_per_user(self):
+        self.store.upsert_watch(123, "Pikachu V", 100)
+        self.store.upsert_watch(456, "Mew V", 100)
+        pikachu = self.store.list_watches_for_user(123)[0]
+        mew = self.store.list_watches_for_user(456)[0]
+        self.store.enqueue_watch_matches(pikachu, [
+            {"item_id": f"p-{price}", "title": "Pikachu V", "price": price,
+             "shipping": 0, "url": f"https://example.com/p-{price}"}
+            for price in (30, 10, 20, 40)
+        ], limit=3, initial=True)
+        self.store.enqueue_watch_matches(mew, [{
+            "item_id": "m-1", "title": "Mew V", "price": 5, "shipping": 0,
+            "url": "https://example.com/m-1",
+        }])
+        batches = self.store.claim_digest_batches(interval=1000)
+        self.assertEqual(
+            [entry.item_id for entry in next(batch for batch in batches
+                                             if batch[0].user_id == 123)],
+            ["p-10", "p-20", "p-30"],
+        )
+        # User 123 is paced after its initial digest, while other users were
+        # fairly claimable in the same transaction.
+        self.assertTrue(any(batch[0].user_id == 456 for batch in batches))
+        self.assertEqual(self.store.claim_digest_batches(interval=1000), [])
+
+    def test_initial_snapshot_of_eighteen_drains_three_then_five_without_starvation(self):
+        self.store.upsert_watch(777, "Charizard V", 100)
+        watch = self.store.list_watches_for_user(777)[0]
+        listings = [
+            {"item_id": f"snapshot-{price:02}", "title": "Charizard V",
+             "price": price, "shipping": 0,
+             "url": f"https://example.com/snapshot-{price:02}"}
+            for price in range(18, 0, -1)
+        ]
+        self.assertEqual(
+            self.store.enqueue_watch_matches(watch, listings, initial=True), 18
+        )
+        sizes = []
+        seen = []
+        for expected_size in (3, 5, 5, 5):
+            batches = self.store.claim_digest_batches(interval=1000)
+            batch = next(group for group in batches if group[0].user_id == 777)
+            self.assertEqual(len(batch), expected_size)
+            sizes.append(len(batch))
+            seen.extend(entry.item_id for entry in batch)
+            for entry in batch:
+                self.store.complete(entry.user_id, entry.item_id)
+            with self.store._connect() as conn:
+                conn.execute(
+                    "UPDATE watchlist_dm_pacing SET next_digest_at = 0 WHERE user_id = 777"
+                )
+            # Repeated source snapshots contain the already delivered/queued
+            # cheapest records but cannot displace later pending records.
+            self.assertEqual(self.store.enqueue_watch_matches(watch, listings), 0)
+        self.assertEqual(sizes, [3, 5, 5, 5])
+        self.assertEqual(len(set(seen)), 18)
+        self.assertEqual(seen, [f"snapshot-{price:02}" for price in range(1, 19)])
+
+    def test_durable_daily_cap_and_stale_search_job_update_are_safe(self):
+        self.assertTrue(self.store.reserve_mercari_daily(24, 20))
+        self.assertFalse(self.store.reserve_mercari_daily(24, 4 + 1))
+        # The accounting is stored in SQLite rather than scheduler memory.
+        reopened = WatchlistStore(self.db_path)
+        self.assertEqual(reopened.mercari_daily_remaining(24), 4)
+
+        self.store.upsert_watch(888, "Mew V", 50)
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE watch_targeted_search_jobs SET next_attempt = 0 "
+                "WHERE user_id = 888 AND normalized_name = 'mew v'"
+            )
+        old_watch = self.store.claim_targeted_searches()[0]
+        self.store.upsert_watch(888, "Mew V", 25)  # clears old job lease
+        self.store.finish_targeted_search(old_watch, delay=0)
+        with self.store._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT next_attempt, claim_token FROM watch_targeted_search_jobs
+                WHERE user_id = 888 AND normalized_name = 'mew v'
+                """
+            ).fetchone()
+        self.assertGreater(row["next_attempt"], 0)
+        self.assertIsNone(row["claim_token"])
+        self.assertEqual(self.store.claim_targeted_searches(), [])
+
+
+class TargetedWatchSearchTests(unittest.TestCase):
+    def test_cache_and_quota_keep_zero_results_distinct_from_unavailable(self):
+        calls = []
+
+        def search(source, query):
+            calls.append((source, query["normalized_name"]))
+            return {
+                "source": source, "status": "ok", "listings": [],
+                "checked": 7, "message": "", "requests": 1,
+            }
+
+        scheduler = TargetedWatchSearch(cache_ttl=1000, budget_window=1000)
+        module = types.SimpleNamespace(search_watch_source=search)
+        first = Watch(1, 1, "Pikachu V", "pikachu v", 50)
+        second = Watch(2, 2, "Mew V", "mew v", 50)
+        with patch.dict(sys.modules, {"watch_sources": module}):
+            results = scheduler.search(first)
+            cached = scheduler.search(first)
+            exhausted = scheduler.search(second)
+        self.assertEqual(results["ebay"]["status"], "ok")
+        self.assertEqual(results["ebay"]["checked"], 7)
+        self.assertEqual(cached["ebay"]["status"], "ok")
+        self.assertEqual(len(calls), 3)  # each source shared from the TTL cache
+        self.assertEqual(exhausted["ebay"]["status"], "unavailable")
+
+    def test_mercari_daily_cap_reserves_adapter_maximum_before_calls(self):
+        calls = []
+
+        def search(source, _query):
+            calls.append(source)
+            return {
+                "source": source, "status": "ok", "listings": [],
+                "checked": 0, "message": "", "requests": 4,
+            }
+
+        scheduler = TargetedWatchSearch(cache_ttl=0, budget_window=1000)
+        module = types.SimpleNamespace(search_watch_source=search)
+        with patch.dict(sys.modules, {"watch_sources": module}):
+            for index in range(MERCARI_DAILY_PERSONAL_REQUEST_CAP // 4):
+                # Simulate an elapsed short source window without advancing a
+                # day; every distinct query is still charged four requests.
+                scheduler._window_started = 0
+                result = scheduler._one_source("mercari", {"item_name": f"Card {index}"})
+                self.assertEqual(result["status"], "ok")
+            scheduler._window_started = 0
+            exhausted = scheduler._one_source("mercari", {"item_name": "One more"})
+        self.assertEqual(exhausted["status"], "unavailable")
+        self.assertIn("daily personal-search quota", exhausted["message"])
+        self.assertEqual(exhausted["mercari_daily_remaining"], 0)
+        self.assertEqual(scheduler.remaining_limits()["mercari_daily"], 0)
+        self.assertEqual(len(calls), MERCARI_DAILY_PERSONAL_REQUEST_CAP // 4)
 
 
 class WatchlistGameValidationTests(unittest.TestCase):
@@ -555,6 +704,109 @@ class WatchlistMatchingTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._drain_pending_once()
         self.assertEqual(self.sent, [(123, "offline", 20)])
         self.assertEqual(self.bot.store.pending_count(), 0)
+
+    async def test_initial_targeted_check_reports_verified_counts_and_queues_cheapest(self):
+        watch = self.bot.store.list_watches_for_user(123)[0]
+        results = {
+            "ebay": {
+                "source": "ebay", "status": "ok", "checked": 4, "requests": 2,
+                "remaining_requests": 0, "listings": [
+                    {"item_id": "ebay-high", "title": "Pikachu V", "price": 28,
+                     "shipping": 0, "url": "https://example.com/high"},
+                    {"item_id": "ebay-low", "title": "Pikachu V", "price": 10,
+                     "shipping": 0, "url": "https://example.com/low"},
+                ], "message": "",
+            },
+            "mercari": {
+                "source": "mercari", "status": "unavailable", "checked": 0,
+                "requests": 0, "remaining_requests": 4,
+                "mercari_daily_remaining": 0, "listings": [],
+                "message": "Mercari daily personal-search quota is exhausted",
+            },
+            "tcgplayer": {
+                "source": "tcgplayer", "status": "partial", "checked": 2,
+                "requests": 1, "remaining_requests": 0, "listings": [
+                    {"item_id": "tcg-mid", "title": "Pikachu V", "price": 20,
+                     "shipping": 0, "url": "https://example.com/mid"},
+                ], "message": "",
+            },
+        }
+        with patch.object(self.bot.search_scheduler, "search", return_value=results):
+            report = await self.bot._initial_targeted_check(watch)
+        self.assertIn("eBay: **2** verified match(es) among 4 checked", report)
+        self.assertIn("TCGplayer: **1** verified match(es) among 2 checked", report)
+        self.assertIn("Mercari: **unavailable**", report)
+        claimed = self.bot.store.claim_digest_batches()
+        self.assertEqual(
+            [entry.item_id for entry in claimed[0]], ["ebay-low", "tcg-mid", "ebay-high"]
+        )
+
+    async def test_watch_command_defers_and_returns_mocked_initial_count(self):
+        interaction = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=987),
+            response=types.SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=types.SimpleNamespace(send=AsyncMock()),
+        )
+        self.bot._initial_targeted_check = AsyncMock(
+            return_value="**Initial targeted check** — eBay: **2** verified match(es) among 4 checked"
+        )
+        command = self.bot.tree.get_command("watch")
+        await command.callback(interaction, "Mew V", 25.0, None, None, None)
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        self.assertIn(
+            "eBay: **2** verified match(es) among 4 checked",
+            interaction.followup.send.await_args.args[0],
+        )
+        self.assertEqual(
+            [(entry.item_name, entry.max_price) for entry in self.bot.store.list_watches_for_user(987)],
+            [("Mew V", 25.0)],
+        )
+
+    async def test_initial_all_source_failures_do_not_claim_a_zero_match(self):
+        watch = self.bot.store.list_watches_for_user(123)[0]
+        results = {
+            source: {
+                "source": source, "status": "unavailable", "checked": 0,
+                "requests": 0, "listings": [], "message": "quota deferred",
+            }
+            for source in ("ebay", "mercari", "tcgplayer")
+        }
+        with patch.object(self.bot.search_scheduler, "search", return_value=results):
+            report = await self.bot._initial_targeted_check(watch)
+        self.assertIn("no zero-match claim was made", report)
+        self.assertEqual(self.bot.store.pending_count(), 0)
+
+    async def test_digest_sold_comps_edits_complete_sibling_embed_list(self):
+        user = AsyncMock()
+        message = AsyncMock()
+        user.send.return_value = message
+        self.bot.fetch_user = AsyncMock(return_value=user)
+        entries = [
+            PendingDM(123, "digest-1", "Pikachu V", 30, {
+                "item_id": "digest-1", "title": "Pikachu V", "price": 20,
+                "shipping": 0, "url": "https://example.com/digest-1",
+            }, 0),
+            PendingDM(123, "digest-2", "Pikachu V", 30, {
+                "item_id": "digest-2", "title": "Pikachu V Alt", "price": 21,
+                "shipping": 0, "url": "https://example.com/digest-2",
+            }, 0),
+        ]
+        comps = {"average": 22, "median": 22, "count": 2, "sales": [
+            {"total": 20, "url": "https://example.com/sale-1"},
+            {"total": 24, "url": "https://example.com/sale-2"},
+        ]}
+        with patch("watchlist_bot.get_sold_comps", return_value=comps):
+            self.assertEqual(await self.bot._send_watch_digest(entries), "sent")
+            await asyncio.sleep(0)
+            await asyncio.gather(*list(self.bot._enrichment_tasks))
+        sent_embeds = user.send.await_args.kwargs["embeds"]
+        self.assertEqual(len(sent_embeds), 2)
+        # Every enrichment edit carries both embeds, so a sibling is never
+        # edited away by another async sold-comps task.
+        self.assertEqual(message.edit.await_count, 2)
+        self.assertTrue(all(
+            len(call.kwargs["embeds"]) == 2 for call in message.edit.await_args_list
+        ))
 
 
 if __name__ == "__main__":

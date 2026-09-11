@@ -80,13 +80,43 @@ def canonical_rarity(game: str, value: str) -> str:
 
 
 def rarity_matches_title(game: str, rarity: str, value: str) -> bool:
-    """Match a saved canonical rarity against title/metadata aliases safely."""
+    """Match an exact recognised rarity family against title/metadata aliases.
+
+    A whole-word substring check alone is not enough: ``Rare`` is present in
+    ``Ultra Rare``, ``Secret Rare``, and ``Super Rare``.  First resolve the
+    longest recognised rarity phrase that the listing actually names, then
+    compare that family exactly.  This similarly keeps ``Common`` distinct
+    from ``Uncommon``.
+    """
     wanted = normalize_catalog_text(rarity)
     aliases = {wanted}
     for code, label in _RARITY_CODES.get(game, {}).items():
         if normalize_catalog_text(label) == wanted:
             aliases.add(code)
-    return any(contains_catalog_phrase(value, alias) for alias in aliases)
+    # These occur as readable catalog/API labels outside the compact code maps
+    # above (especially Pokémon and Yu-Gi-Oh).  Longest-first resolution makes
+    # the specific family win over its trailing "Rare" word.
+    recognised = {
+        "quarter century secret rare", "prismatic ultimate rare",
+        "prismatic collectors rare", "special illustration rare",
+        "illustration rare", "reverse holo rare", "double rare",
+        "ultimate rare", "collector rare", "treasure rare", "special rare",
+        "secret rare", "super rare", "ultra rare", "hyper rare", "holo rare",
+        "mythic rare", "uncommon", "common", "rare", "promo", "leader",
+    }
+    recognised.update(normalize_catalog_text(label)
+                      for labels in _RARITY_CODES.values() for label in labels.values())
+    recognised.add(wanted)
+    matches = [
+        phrase for phrase in recognised
+        if phrase and contains_catalog_phrase(value, phrase)
+    ]
+    if matches:
+        observed = max(matches, key=lambda phrase: (len(phrase.split()), len(phrase)))
+        return observed == wanted
+    # Short catalog codes are retained as a fallback only when no readable
+    # rarity family appeared, e.g. "(SEC)".
+    return any(contains_catalog_phrase(value, alias) for alias in aliases - {wanted})
 
 
 @dataclass(frozen=True)
