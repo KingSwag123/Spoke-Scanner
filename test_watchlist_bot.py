@@ -366,6 +366,16 @@ class WatchlistStoreTests(unittest.TestCase):
         self.assertIsNone(row["claim_token"])
         self.assertEqual(self.store.claim_targeted_searches(), [])
 
+    def test_legacy_watch_gets_missing_search_job_without_resetting_lease(self):
+        self.store.upsert_watch(777, "Exodia", 100)
+        with self.store._connect() as conn:
+            conn.execute("DELETE FROM watch_targeted_search_jobs WHERE user_id = 777")
+        watches = self.store.claim_targeted_searches()
+        self.assertEqual([w.item_name for w in watches], ["Exodia"])
+        self.assertEqual(self.store.claim_targeted_searches(), [])
+        self.store.finish_targeted_search(watches[0], delay=3600)
+        self.assertEqual(self.store.claim_targeted_searches(), [])
+
 
 class TargetedWatchSearchTests(unittest.TestCase):
     def test_cache_and_quota_keep_zero_results_distinct_from_unavailable(self):

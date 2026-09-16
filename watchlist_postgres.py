@@ -600,6 +600,22 @@ class PostgresWatchlistStore:
     def claim_targeted_searches(self, limit: int = 1) -> list[Watch]:
         """Lock and lease due watch searches, preserving FIFO fairness."""
         with self._connect() as conn:
+            # Watches saved before targeted searches existed have no job.
+            # Repair missing rows without resetting existing leases or pacing.
+            conn.execute(
+                """
+                INSERT INTO watch_targeted_search_jobs (user_id, normalized_name)
+                SELECT w.user_id, w.normalized_name FROM watchlists w
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM watch_targeted_search_jobs j
+                    WHERE j.user_id = w.user_id
+                      AND j.normalized_name = w.normalized_name
+                )
+                ORDER BY w.id
+                FOR KEY SHARE OF w
+                ON CONFLICT (user_id, normalized_name) DO NOTHING
+                """
+            )
             rows = conn.execute(
                 """
                 SELECT w.id, w.user_id, w.item_name, w.normalized_name, w.max_price,

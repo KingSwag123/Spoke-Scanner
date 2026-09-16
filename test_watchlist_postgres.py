@@ -288,6 +288,19 @@ class PostgresWatchlistStoreTests(unittest.TestCase):
         self.assertIsNone(row[1])
         self.assertEqual(self.store.claim_targeted_searches(), [])
 
+    def test_legacy_watch_gets_missing_search_job_without_resetting_lease(self):
+        self.store.upsert_watch(self.user_id, "Exodia", 100)
+        with psycopg.connect() as conn:
+            conn.execute(
+                "DELETE FROM watch_targeted_search_jobs WHERE user_id = %s",
+                (self.user_id,),
+            )
+        watches = self.store.claim_targeted_searches()
+        self.assertEqual([w.item_name for w in watches], ["Exodia"])
+        self.assertEqual(self.store.claim_targeted_searches(), [])
+        self.store.finish_targeted_search(watches[0], delay=3600)
+        self.assertEqual(self.store.claim_targeted_searches(), [])
+
     def test_bulk_delete_isolated_cleans_work_and_invalidates_claim(self):
         self.store.upsert_watch(self.user_id, "Pikachu V", 30)
         self.store.upsert_watch(self.user_id, "Mew V", 30)

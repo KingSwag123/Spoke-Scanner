@@ -963,6 +963,13 @@ class WatchlistStore:
         now = time.time()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO watch_targeted_search_jobs
+                    (user_id, normalized_name)
+                SELECT user_id, normalized_name FROM watchlists
+                """
+            )
             rows = conn.execute(
                 """
                 SELECT w.id, w.user_id, w.item_name, w.normalized_name, w.max_price,
