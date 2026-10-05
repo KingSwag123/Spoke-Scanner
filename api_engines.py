@@ -53,6 +53,8 @@ from config import (
     _SEALED_INDEX_TTL,
     _SEALED_INDICATORS,
     _SEALED_MIN_TOKENS,
+    _SEALED_PACK_COUNT_RE,
+    _SEALED_PARTIAL_TOKENS,
     _SINGLE_OVERRIDE,
     _SLAB_GRADE_RE,
     _SLAB_INDICATORS,
@@ -1139,6 +1141,15 @@ def _sealed_idx(game: str) -> list:
     return _sealed_index.get(game, [])
 
 
+def _sealed_title_is_partial(title: str, title_toks: set, product_toks: frozenset) -> bool:
+    """True if the title describes less than the matched product: a partial-
+    product word the product itself lacks, or a small pack count on a box."""
+    if (title_toks & _SEALED_PARTIAL_TOKENS) - product_toks:
+        return True
+    return bool("box" in product_toks and "pack" not in product_toks
+                and _SEALED_PACK_COUNT_RE.search(title))
+
+
 def fetch_sealed_price(game: str, title: str):
     """Market price for a sealed listing, or None if no confident match.
 
@@ -1154,7 +1165,7 @@ def fetch_sealed_price(game: str, title: str):
     idf = _sealed_idf.get(game, {})
     title_toks = set(re.findall(r"[a-z0-9]+", _ascii(title).lower()))
     scored = [
-        (sum(idf.get(t, 0.0) for t in toks), len(toks), price, name)
+        (sum(idf.get(t, 0.0) for t in toks), len(toks), price, name, toks)
         for toks, price, name in idx
         if toks <= title_toks
     ]
@@ -1164,10 +1175,12 @@ def fetch_sealed_price(game: str, title: str):
     # then name — so equal-score ties resolve the same way every run instead of
     # depending on index insertion order.
     scored.sort(key=lambda x: (-x[0], -x[1], x[3]))
-    best_score, _best_ntoks, best_price, best_name = scored[0]
+    best_score, _best_ntoks, best_price, best_name, best_toks = scored[0]
+    if _sealed_title_is_partial(title, title_toks, best_toks):
+        return None
     # Ambiguity guard: a different product tied at the top score with a materially
     # different price means we can't tell them apart — don't guess.
-    for score, _ntoks, price, name in scored[1:]:
+    for score, _ntoks, price, name, _toks in scored[1:]:
         if best_score - score > 1e-9:
             break
         if name != best_name and abs(price - best_price) > _SEALED_AMBIG_PRICE_TOL * max(price, best_price):

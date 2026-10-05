@@ -77,5 +77,51 @@ class OpenedConditionTests(unittest.TestCase):
             self.assertFalse(api_engines.is_opened_condition(condition), condition)
 
 
+class PartialSealedProductTests(unittest.TestCase):
+    def setUp(self):
+        products = [
+            ("Burst Protocol Booster Box [1st Edition]", 89.26),
+            ("Chaos Origins Booster Box [1st Edition]", 89.80),
+            ("Pokemon GO Mini Tin", 12.0),
+            ("Paldea Evolved 3 Pack Blister", 14.0),
+        ]
+        api_engines._sealed_index["testgame"] = [
+            (api_engines._sealed_tokens(name), price, name) for name, price in products
+        ]
+        api_engines._sealed_idf["testgame"] = {}
+        api_engines._sealed_until["testgame"] = float("inf")
+
+    def tearDown(self):
+        for cache in (api_engines._sealed_index, api_engines._sealed_idf, api_engines._sealed_until):
+            cache.pop("testgame", None)
+
+    def price(self, title):
+        return api_engines.fetch_sealed_price("testgame", title)
+
+    def test_full_box_still_matches(self):
+        self.assertEqual(
+            self.price("Yu-Gi-Oh Burst Protocol 1st Edition Booster Box Factory Sealed"),
+            (89.26, "Burst Protocol Booster Box [1st Edition]"),
+        )
+        # A large pack count is how sellers describe a genuine box.
+        self.assertIsNotNone(self.price("Chaos Origins 1st Edition Booster Box 24 Packs Sealed"))
+
+    def test_partial_products_are_not_priced_as_the_box(self):
+        for title in (
+            "Yu-Gi-Oh Burst Protocol 1st Edition English TCG Sealed Mini Booster Box",
+            "Yu-Gi-Oh Chaos Origins 4 Pack Booster Box 1st Ed Token Card Konami TCG",
+            "Chaos Origins 1st Edition Booster Box 3-Pack",
+            "EMPTY Burst Protocol 1st Edition Booster Box display only",
+        ):
+            self.assertIsNone(self.price(title), title)
+
+    def test_words_the_product_itself_carries_are_allowed(self):
+        self.assertEqual(self.price("Pokemon GO Mini Tin sealed")[1], "Pokemon GO Mini Tin")
+        self.assertEqual(
+            self.price("Pokemon Paldea Evolved 3 Pack Blister new")[1],
+            "Paldea Evolved 3 Pack Blister",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

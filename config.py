@@ -50,8 +50,11 @@ CHECK_INTERVAL   = 300     # seconds between scan cycles (5 min)
 SEEN_EXPIRY_DAYS = 90      # drop seen entries older than this (anti-bloat)
 
 DEAL_RATIO       = 0.85   # a deal = (price + shipping) <= market_price * DEAL_RATIO
-SEALED_SANITY_FLOOR = 0.20 # backstop: a sealed "deal" below market × this is almost
-                           # always a wrong/bulk match, not a real deal — drop it
+SEALED_SANITY_FLOOR = 0.35 # backstop: a sealed "deal" below market × this is almost
+                           # always a wrong/bulk match, not a real deal — drop it.
+                           # Raised from 0.20: partial products with no telltale
+                           # title word (a small box matched to the full booster
+                           # box) clustered at 0.26-0.33 of market.
 SINGLE_SANITY_FLOOR = 0.25 # same backstop for singles: a listing below market × this
                            # is almost always a wrong cross-set/printing match (e.g. a
                            # $5 Celebrations reprint priced against a $229 Base Set card)
@@ -636,6 +639,18 @@ _SEALED_DROP = {
 # single retail unit (the booster box itself); genuine bulk "display" mismatches are
 # instead caught by the SEALED_SANITY_FLOOR backstop below.
 _SEALED_BULK_TOKENS = {"case"}
+
+# Title words that mean the listing is LESS than the product it token-matches
+# ("Booster Box ... Mini", "Booster Box Token Card", "EMPTY Booster Box"). The
+# subset match ignores extra title words, so without this such a listing is priced
+# as the full product. Allowed when the matched product carries the word itself
+# (a "Mini Tin" is a real product).
+_SEALED_PARTIAL_TOKENS = {"mini", "token", "empty"}
+
+# A small pack count in the title ("4 Pack", "3-pack") while the matched product
+# is a box. Counts of 10+ are left alone: sellers routinely write "36 Packs" on a
+# genuine booster box.
+_SEALED_PACK_COUNT_RE = re.compile(r"\b([1-9])\s*-?\s*packs?\b", re.IGNORECASE)
 
 # Tie-break safety: if two products tie on the top match score but their market
 # prices differ by more than this fraction, the match is ambiguous — skip rather
