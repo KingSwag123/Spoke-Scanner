@@ -24,6 +24,7 @@ import requests
 
 from config import (
     _API_MIN_INTERVAL,
+    _ART_CASE_RE,
     _BLOCKED_LANGS,
     _CUSTOM_WORD_RE,
     _FAKE_INDICATORS,
@@ -44,6 +45,7 @@ from config import (
     _ONEPIECE_INDEX_TTL,
     _OP_CODE_RE,
     _OPENED_CONDITION_RE,
+    _OVERSIZE_INDICATORS,
     _REPRINT_MARKER_RE,
     _REPRINT_OWN_TOTALS,
     _SEALED_AMBIG_PRICE_TOL,
@@ -135,10 +137,19 @@ def is_allowed_language(title: str) -> bool:
 # Authenticity filter — block DIY / proxy / fan-art listings
 # ---------------------------------------------------------------------------
 
-def is_official_card(title: str) -> bool:
-    """Return False if the title contains any known fake/DIY indicator."""
+def is_official_card(title: str, game: str | None = None) -> bool:
+    """Return False if the title contains any known fake/DIY indicator, or
+    describes a product that is not the standard card (oversized promo, art
+    case). Pass the game so Magic's genuine oversized cards are not dropped."""
     t = title.lower()
-    return not (any(ind in t for ind in _FAKE_INDICATORS) or _CUSTOM_WORD_RE.search(t))
+    if any(ind in t for ind in _FAKE_INDICATORS) or _CUSTOM_WORD_RE.search(t):
+        return False
+    if game == "mtg":
+        # Oversized-only Magic cards and the "(Extended Art)" treatment are real
+        # and priced as themselves; fetch_mtg_price rejects an oversized copy of
+        # a normal card.
+        return True
+    return not (any(ind in t for ind in _OVERSIZE_INDICATORS) or _ART_CASE_RE.search(t))
 
 
 def is_anniversary_reprint(title: str, set_total: str) -> bool:
@@ -480,7 +491,11 @@ def _progressive_price(tokens: list[str], fetch_one, cache_prefix: str):
     return None
 
 
-def _scryfall_one(name: str, foil: bool):
+def _scryfall_one(name: str, foil: bool, oversize: bool = False):
+    """One Scryfall fuzzy-name lookup. With oversize=True (the listing is sold as
+    an oversized card) the match only counts when Scryfall's card is itself
+    oversized — a plane, scheme, Vanguard or MicroProse card. An oversized copy
+    of a normal card is a different, cheaper product: a genuine no-match."""
     if not _fast_gate():
         return _RATELIMITED
     _fast_throttle()
@@ -506,6 +521,8 @@ def _scryfall_one(name: str, foil: bool):
         d = r.json()
     except ValueError:
         return _TRANSIENT               # unparseable body — transient, don't cache
+    if oversize and not d.get("oversized"):
+        return None
     prices = d.get("prices", {}) or {}
     raw = (prices.get("usd_foil") if foil else None) or prices.get("usd") or prices.get("usd_foil")
     try:
@@ -515,8 +532,15 @@ def _scryfall_one(name: str, foil: bool):
 
 
 def fetch_mtg_price(tokens: list[str], title: str):
-    foil = "foil" in title.lower()
-    return _progressive_price(tokens, lambda n: _scryfall_one(n, foil), f"mtg{'F' if foil else ''}")
+    t = title.lower()
+    foil = "foil" in t
+    # Magic sellers say "oversized"; "jumbo" alone is not used here because
+    # "Jumbo Cactuar" is a card name.
+    oversize = "oversize" in t
+    return _progressive_price(
+        tokens, lambda n: _scryfall_one(n, foil, oversize),
+        f"mtg{'F' if foil else ''}{'O' if oversize else ''}",
+    )
 
 
 def _lorcast_one(name: str, foil: bool):
@@ -1147,7 +1171,9 @@ def _sealed_title_is_partial(title: str, title_toks: set, product_toks: frozense
     box. Only booster boxes: an Elite Trainer Box really does hold "9 packs"."""
     if (title_toks & _SEALED_PARTIAL_TOKENS) - product_toks:
         return True
-    return bool({"booster", "box"} <= product_toks and "pack" not in product_toks
+    # Magic Collector Booster Boxes genuinely hold as few as 4 packs.
+    return bool({"booster", "box"} <= product_toks
+                and not {"pack", "collector"} & product_toks
                 and _SEALED_PACK_COUNT_RE.search(title))
 
 

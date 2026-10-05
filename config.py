@@ -428,25 +428,37 @@ _FAKE_INDICATORS = {
     "3d print", "bootleg", "homemade", "unofficial",
     "gold foil fan", "foil fan art", "not official", "custom made",
     "custom printed", "novelty", "altered art",
-    # Official-but-different products that carry a real card's name and number
-    # and would otherwise be priced as the standard card: oversized promo cards
-    # ("oversize" also covers "oversized") and acrylic display cases sold with
-    # extended artwork. Plain "extended art" is NOT listed — it is a genuine
-    # Magic card treatment.
-    "jumbo", "oversize", "display case", "extended art case", "extended artwork",
+    # A display case is not a card, whatever card name and number it carries.
+    "display case",
 }
 
 # "custom" as a whole word (custom artwork, custom holo, …). Word-bounded so
-# "customs" and "customer" in a title never trip it.
-_CUSTOM_WORD_RE = re.compile(r"\bcustom\b", re.IGNORECASE)
+# "customs" and "customer" in a title never trip it; "Custom Catcher" is a real
+# Pokémon Trainer card.
+_CUSTOM_WORD_RE = re.compile(r"\bcustom\b(?!\s+catcher)", re.IGNORECASE)
+
+# Oversized promo cards carry a real card's name and number and would be priced
+# as the standard card ("oversize" also covers "oversized"). NOT applied to
+# Magic by is_official_card: planes, schemes, Vanguard and MicroProse cards
+# exist ONLY oversized and are priced as themselves, so for Magic the price
+# source decides (see fetch_mtg_price) — and "Jumbo Cactuar" is a card name.
+_OVERSIZE_INDICATORS = ("jumbo", "oversize")
+
+# Acrylic / magnetic cases printed with a card's extended artwork ("EXTENDED ART
+# CASE", "EXTENDED ART MAGNETIC CASE", "Extended Artwork Display Case"). Ordered
+# and NOT applied to Magic, where "(Extended Art)" is a genuine card treatment
+# and "Case of the …" is a card name.
+_ART_CASE_RE = re.compile(r"\bextended art(?:work)?\b.*\bcases?\b", re.IGNORECASE)
 
 # English Pokémon anniversary sets reprint older cards and KEEP the original
 # card number and set total (e.g. the 30th Anniversary "Dark Tyranitar 19/109").
 # The price lookup pins a card by number + set total, so such a reprint lands on
 # the original printing's price and fires a false deal. Celebrations' own cards
-# are numbered x/25 and match correctly, so that total is exempt.
+# are numbered x/25 and match correctly, so that total is exempt. The 2026 set
+# is catalogued as "30th Celebration" (singular), so that wording counts too.
 _REPRINT_MARKER_RE = re.compile(
-    r"\b(?:25th|30th)\s+anniv(?:ersary)?\b|\bclassic collection\b|\bcelebrations\b",
+    r"\b(?:25th|30th)[\s-]*(?:anniv(?:ersary)?|celebrations?)\b"
+    r"|\bclassic collection\b|\bcelebrations\b",
     re.IGNORECASE,
 )
 _REPRINT_OWN_TOTALS = {25}
@@ -665,10 +677,12 @@ _SEALED_BULK_TOKENS = {"case"}
 # (a "Mini Tin" is a real product).
 _SEALED_PARTIAL_TOKENS = {"mini", "token", "empty"}
 
-# A small pack count in the title ("4 Pack", "3-pack") while the matched product
-# is a booster box. Counts of 10+ are left alone: sellers routinely write "36
-# Packs" on a genuine booster box.
-_SEALED_PACK_COUNT_RE = re.compile(r"\b([1-9])\s*-?\s*packs?\b", re.IGNORECASE)
+# A small pack count in the title ("4 Pack", "3-pack", "3 Booster Packs", "6pk")
+# while the matched product is a booster box. Counts of 10+ are left alone:
+# sellers routinely write "36 Packs" on a genuine booster box.
+_SEALED_PACK_COUNT_RE = re.compile(
+    r"\b([1-9])\s*-?\s*(?:booster\s+)?(?:packs?|pks?)(?![a-z])", re.IGNORECASE
+)
 
 # Tie-break safety: if two products tie on the top match score but their market
 # prices differ by more than this fraction, the match is ambiguous — skip rather

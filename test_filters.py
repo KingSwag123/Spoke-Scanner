@@ -1,9 +1,10 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import api_engines
 import config
 import discord_router
+import mercari_source
 
 
 class OfficialCardFilterTests(unittest.TestCase):
@@ -11,30 +12,73 @@ class OfficialCardFilterTests(unittest.TestCase):
         for title in (
             "Pokemon Gengar EX 34/119 Jumbo Card XY: Phantom Forces 034/119 Holofoil MP",
             "Pokémon TCG Deoxys EX Holo Rare Card 53/116 JUMBO Oversized Pokemon Card MP",
-            "MTG The Ur-Dragon Oversized Commander 2017 Foil NM",
-            "Atraxa, Praetors' Voice (Commander 2016) Oversize Cards Foil",
         ):
+            self.assertFalse(api_engines.is_official_card(title, "pokemon"), title)
             self.assertFalse(api_engines.is_official_card(title), title)
+
+    def test_magic_oversized_titles_are_left_to_the_price_lookup(self):
+        # Planes, schemes, Vanguard and MicroProse cards exist only oversized, and
+        # "Jumbo Cactuar" is a card name; fetch_mtg_price sorts out the rest.
+        for title in (
+            "Aswan Jaguar (MicroProse) Oversize Cards Regular",
+            "All in Good Time Archenemy OVERSIZED Card Regular MTG TCG CARD NM",
+            "MTG The Ur-Dragon Oversized Commander 2017 Foil NM",
+            "MTG Jumbo Cactuar Final Fantasy Borderless Foil NM",
+        ):
+            self.assertTrue(api_engines.is_official_card(title, "mtg"), title)
 
     def test_display_cases_and_custom_items_are_rejected(self):
         for title in (
             "Zapdos Ex 202/165 - 151 | Pokémon Custom Extended Artwork Display Case",
             "POKEMON TCG EXTENDED ART CASE Hydreigon ex SIR 169/086 SV: White Flare",
+            "POKEMON TCG EXTENDED ART MAGNETIC CASE PSA CARD Celebi EX UR 141/149 BCR",
             "Hydreigon Ex 169/086 Pokémon Card Extended Art Display Case White Flare",
             "Charizard 4/102 custom holo",
         ):
-            self.assertFalse(api_engines.is_official_card(title), title)
+            self.assertFalse(api_engines.is_official_card(title, "pokemon"), title)
 
     def test_genuine_cards_still_pass(self):
-        for title in (
-            # "Extended Art" is an official Magic treatment.
-            "Bloodline Recollector (Extended Art) 427 NM Reality Fracture MTG",
-            "Tifa, Martial Artist (Extended Art) -Foil Mint",
-            # "custom" must match as a whole word only.
-            "Charizard ex 199/165 no customs fees for US customers",
-            "Pokemon Gengar EX 34/119 XY Phantom Forces Holo Rare",
+        for title, game in (
+            # "Extended Art" is an official Magic treatment, "Case of the …" a
+            # Magic card name.
+            ("Bloodline Recollector (Extended Art) 427 NM Reality Fracture MTG", "mtg"),
+            ("Tifa, Martial Artist (Extended Art) -Foil Mint", "mtg"),
+            ("MTG Extended Art Case of the Crimson Pulse Foil NM", "mtg"),
+            # "custom" must match as a whole word only, and not the real card.
+            ("Charizard ex 199/165 no customs fees for US customers", "pokemon"),
+            ("Custom Catcher 231/214 Lost Thunder Secret Rare Gold", "pokemon"),
+            ("Pokemon Gengar EX 34/119 XY Phantom Forces Holo Rare", "pokemon"),
         ):
-            self.assertTrue(api_engines.is_official_card(title), title)
+            self.assertTrue(api_engines.is_official_card(title, game), title)
+
+
+class MagicOversizePricingTests(unittest.TestCase):
+    """An oversized listing is priced only when Scryfall's card is oversized."""
+
+    def lookup(self, card, **kwargs):
+        response = Mock(status_code=200)
+        response.json.return_value = card
+        with patch.object(api_engines, "_fast_gate", return_value=True), \
+                patch.object(api_engines, "_fast_throttle"), \
+                patch("api_engines.requests.get", return_value=response):
+            return api_engines._scryfall_one(card["name"], False, **kwargs)
+
+    def test_oversized_only_card_is_priced_as_itself(self):
+        card = {"name": "Aswan Jaguar", "oversized": True, "prices": {"usd": "29.95"}}
+        self.assertEqual(self.lookup(card, oversize=True), (29.95, "Aswan Jaguar"))
+
+    def test_oversized_copy_of_a_normal_card_is_a_no_match(self):
+        card = {"name": "The Ur-Dragon", "oversized": False, "prices": {"usd": "36.35"}}
+        self.assertIsNone(self.lookup(card, oversize=True))
+        # The same card listed normally is unaffected.
+        self.assertEqual(self.lookup(card), (36.35, "The Ur-Dragon"))
+
+    def test_only_the_word_oversize_switches_the_check_on(self):
+        with patch.object(api_engines, "_progressive_price") as progressive:
+            api_engines.fetch_mtg_price(["the", "ur-dragon"], "MTG The Ur-Dragon Oversized Commander 2017 NM")
+            self.assertEqual(progressive.call_args.args[2], "mtgO")
+            api_engines.fetch_mtg_price(["jumbo", "cactuar"], "MTG Jumbo Cactuar Final Fantasy Foil")
+            self.assertEqual(progressive.call_args.args[2], "mtgF")
 
 
 class AnniversaryReprintTests(unittest.TestCase):
@@ -45,6 +89,8 @@ class AnniversaryReprintTests(unittest.TestCase):
             ("Genesect Ex 11/101 30th Anniversary Pokémon Tcg Card English", "101"),
             ("Charizard 4/102 Celebrations Classic Collection", "102"),
             ("Pikachu 58/102 25th Anniv Classic Collection", "102"),
+            # The 2026 set's catalog name is singular.
+            ("Dark Tyranitar 19/109 30th Celebration Holo Rare English", "109"),
         ):
             self.assertTrue(api_engines.is_anniversary_reprint(title, total), title)
 
@@ -98,6 +144,20 @@ class JapanImportCostTests(unittest.TestCase):
         price, market = 45.0, 108.25
         self.assertLessEqual(price + config.jp_import_cost(price), market * config.DEAL_RATIO)
 
+    def test_listing_keeps_its_real_shipping_and_carries_the_estimate_apart(self):
+        # Personal watches read `shipping`; an estimate there would be counted
+        # against a member's max price and shown to them as a shipping charge.
+        raw = [{"id": "m1", "name": "ストームエメラルダ BOX 新品未開封 シュリンク付き", "price": 10310}]
+        with patch.object(mercari_source, "MERCARI_JP_QUERIES", [("pokemon", "x")]), \
+                patch.object(mercari_source, "_jpy_per_usd", return_value=150.0), \
+                patch.object(mercari_source, "_jp_search", return_value=raw), \
+                patch.object(mercari_source, "_jp_match_en_title",
+                             return_value="storm emeralda booster box"):
+            (listing,) = mercari_source.fetch_mercari_jp_listings()
+        self.assertEqual(listing["price"], 68.73)
+        self.assertEqual(listing["shipping"], 0.0)
+        self.assertEqual(listing["import_cost"], config.jp_import_cost(68.73))
+
     @patch("discord_router._post_embed", return_value=True)
     def test_sealed_alert_names_the_import_estimate(self, post):
         discord_router.send_sealed_alert(
@@ -116,6 +176,7 @@ class PartialSealedProductTests(unittest.TestCase):
             ("Chaos Origins Booster Box [1st Edition]", 89.80),
             ("Pokemon GO Mini Tin", 12.0),
             ("Surging Sparks Elite Trainer Box", 55.0),
+            ("Commander Masters - Collector Booster Box", 300.0),
             ("Paldea Evolved 3 Pack Blister", 14.0),
         ]
         api_engines._sealed_index["testgame"] = [
@@ -144,12 +205,18 @@ class PartialSealedProductTests(unittest.TestCase):
             "Yu-Gi-Oh Burst Protocol 1st Edition English TCG Sealed Mini Booster Box",
             "Yu-Gi-Oh Chaos Origins 4 Pack Booster Box 1st Ed Token Card Konami TCG",
             "Chaos Origins 1st Edition Booster Box 3-Pack",
+            "Chaos Origins 3 Booster Pack Box 1st Edition Booster Box",
             "EMPTY Burst Protocol 1st Edition Booster Box display only",
         ):
             self.assertIsNone(self.price(title), title)
 
     def test_words_the_product_itself_carries_are_allowed(self):
         self.assertEqual(self.price("Pokemon GO Mini Tin sealed")[1], "Pokemon GO Mini Tin")
+        # A Magic Collector Booster Box genuinely contains 4 packs.
+        self.assertEqual(
+            self.price("MTG Commander Masters Collector Booster Box 4 Packs Factory Sealed")[1],
+            "Commander Masters - Collector Booster Box",
+        )
         # An Elite Trainer Box genuinely contains 9 packs.
         self.assertEqual(
             self.price("Pokemon Surging Sparks Elite Trainer Box 9 Packs Sealed")[1],

@@ -475,16 +475,25 @@ def scan_open_market(
                     drop["nomatch"] += 1
                     print(f"  [SKUMISMATCH] tcgcsv ${market_price:.2f} vs API ${src_market:.2f} — {title[:44]}")
                     continue
-                total = price + shipping
+                # Japanese-marketplace listings carry an estimated cost of importing
+                # the box (config.jp_import_cost). It counts toward the deal test —
+                # the market side is the US price — but it is not part of what the
+                # seller is asking, so it stays out of `shipping`, which personal
+                # watches read, and out of the too-cheap backstop below.
+                import_cost = item.get("import_cost", 0.0)
+                listed = price + shipping
+                total = listed + import_cost
                 if total > market_price * DEAL_RATIO:
                     drop["nodeal"] += 1
                     print(f"  [NODEAL]  sealed ${total:.2f} vs mkt ${market_price:.2f} — {matched_name[:40]}")
                     continue
-                # Too-good-to-be-true backstop: a sealed total far below market is almost
-                # always a wrong/bulk match (or empty/damaged lot), not a real deal.
-                if total < market_price * SEALED_SANITY_FLOOR:
+                # Too-good-to-be-true backstop: a sealed listing far below market is
+                # almost always a wrong/bulk match (or empty/damaged lot), not a real
+                # deal. Judged on the listed amount: a flat import estimate would lift
+                # every cheap Japanese listing back over the floor.
+                if listed < market_price * SEALED_SANITY_FLOOR:
                     drop["nodeal"] += 1
-                    print(f"  [BADMATCH] sealed ${total:.2f} vs mkt ${market_price:.2f} "
+                    print(f"  [BADMATCH] sealed ${listed:.2f} vs mkt ${market_price:.2f} "
                           f"(<{SEALED_SANITY_FLOOR:.0%}) — {title[:40]}")
                     continue
                 channel, webhook_url = determine_channel(game, title, sealed=True)
@@ -494,7 +503,8 @@ def scan_open_market(
                     continue
                 print(f"  [SEALED] ${total:.2f} vs mkt ${market_price:.2f} → #{game}/{channel} — {title[:48]}")
                 sent = send_sealed_alert(
-                    title, item["url"], price, shipping, market_price, webhook_url, game,
+                    title, item["url"], price, shipping + import_cost, market_price,
+                    webhook_url, game,
                     store=item.get("store", "eBay"),
                     condition=item["condition"],
                     language=item["language"],
@@ -504,8 +514,7 @@ def scan_open_market(
                     # show the original Japanese title beneath it.
                     en_title=((matched_name or item.get("en_title"))
                               if item.get("source") in JP_MARKET_SOURCES else None),
-                    ship_label=("est. import cost"
-                                if item.get("source") in JP_MARKET_SOURCES else "ship"),
+                    ship_label="est. import cost" if import_cost else "ship",
                 )
                 if sent:
                     mark_seen(item_id, seen)
@@ -513,7 +522,7 @@ def scan_open_market(
                 continue
 
             # 4) Single cards: authenticity + lot safeguards.
-            if not is_official_card(title):
+            if not is_official_card(title, game):
                 drop["unofficial"] += 1
                 continue
             if not is_single_card(title):

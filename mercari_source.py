@@ -269,9 +269,11 @@ def fetch_mercari_jp_listings() -> list[dict]:
                 "item_id":   f"mjp-{item_id}",
                 "title":     title,
                 "price":     usd,
-                # Domestic shipping is seller-paid (送料込み, filtered server-side);
-                # what a US buyer still pays is the estimated import cost.
-                "shipping":  jp_import_cost(usd),
+                "shipping":  0.0,          # JP listings are overwhelmingly 送料込み (shipping incl.)
+                # What a US buyer pays on top to get the box out of Japan. Kept
+                # apart from `shipping`: it is an estimate, not a listed charge,
+                # and only the public deal test adds it in.
+                "import_cost": jp_import_cost(usd),
                 "url":       f"https://jp.mercari.com/item/{item_id}",
                 "condition": "New/Unopened (JP)",
                 "language":  "Japanese",

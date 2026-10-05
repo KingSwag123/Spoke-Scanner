@@ -117,9 +117,11 @@ def fetch_yahoo_jp_listings() -> list[dict]:
                 "item_id":   f"yja-{iid}",
                 "title":     title,
                 "price":     usd,
-                # Domestic shipping is free (filtered above); what a US buyer
-                # still pays is the estimated import cost.
-                "shipping":  jp_import_cost(usd),
+                "shipping":  0.0,           # free-shipping listings only (filtered above)
+                # What a US buyer pays on top to get the box out of Japan. Kept
+                # apart from `shipping`: it is an estimate, not a listed charge,
+                # and only the public deal test adds it in.
+                "import_cost": jp_import_cost(usd),
                 "url":       f"https://auctions.yahoo.co.jp/jp/auction/{iid}",
                 "condition": "New/Unopened (JP)",
                 "language":  "Japanese",
