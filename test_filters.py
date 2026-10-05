@@ -83,6 +83,7 @@ class PartialSealedProductTests(unittest.TestCase):
             ("Burst Protocol Booster Box [1st Edition]", 89.26),
             ("Chaos Origins Booster Box [1st Edition]", 89.80),
             ("Pokemon GO Mini Tin", 12.0),
+            ("Surging Sparks Elite Trainer Box", 55.0),
             ("Paldea Evolved 3 Pack Blister", 14.0),
         ]
         api_engines._sealed_index["testgame"] = [
@@ -117,6 +118,11 @@ class PartialSealedProductTests(unittest.TestCase):
 
     def test_words_the_product_itself_carries_are_allowed(self):
         self.assertEqual(self.price("Pokemon GO Mini Tin sealed")[1], "Pokemon GO Mini Tin")
+        # An Elite Trainer Box genuinely contains 9 packs.
+        self.assertEqual(
+            self.price("Pokemon Surging Sparks Elite Trainer Box 9 Packs Sealed")[1],
+            "Surging Sparks Elite Trainer Box",
+        )
         self.assertEqual(
             self.price("Pokemon Paldea Evolved 3 Pack Blister new")[1],
             "Paldea Evolved 3 Pack Blister",

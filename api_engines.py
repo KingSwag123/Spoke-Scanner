@@ -1143,10 +1143,11 @@ def _sealed_idx(game: str) -> list:
 
 def _sealed_title_is_partial(title: str, title_toks: set, product_toks: frozenset) -> bool:
     """True if the title describes less than the matched product: a partial-
-    product word the product itself lacks, or a small pack count on a box."""
+    product word the product itself lacks, or a small pack count on a booster
+    box. Only booster boxes: an Elite Trainer Box really does hold "9 packs"."""
     if (title_toks & _SEALED_PARTIAL_TOKENS) - product_toks:
         return True
-    return bool("box" in product_toks and "pack" not in product_toks
+    return bool({"booster", "box"} <= product_toks and "pack" not in product_toks
                 and _SEALED_PACK_COUNT_RE.search(title))
 
 

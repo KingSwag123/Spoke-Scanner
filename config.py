@@ -648,8 +648,8 @@ _SEALED_BULK_TOKENS = {"case"}
 _SEALED_PARTIAL_TOKENS = {"mini", "token", "empty"}
 
 # A small pack count in the title ("4 Pack", "3-pack") while the matched product
-# is a box. Counts of 10+ are left alone: sellers routinely write "36 Packs" on a
-# genuine booster box.
+# is a booster box. Counts of 10+ are left alone: sellers routinely write "36
+# Packs" on a genuine booster box.
 _SEALED_PACK_COUNT_RE = re.compile(r"\b([1-9])\s*-?\s*packs?\b", re.IGNORECASE)
 
 # Tie-break safety: if two products tie on the top match score but their market
