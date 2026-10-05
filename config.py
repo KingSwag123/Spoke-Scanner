@@ -173,6 +173,24 @@ MERCARI_JP_PAGE_SIZE        = 60     # newest-first listings per query
 MERCARI_JP_REQUEST_INTERVAL = 2.0    # polite spacing between JP API calls (s)
 MERCARI_JP_MIN_PRICE_JPY    = 4000   # ignore loose packs / junk below this
 
+# What it costs a US buyer to get ONE box out of Japan, on top of the listing
+# price. Japanese marketplaces (Mercari JP, Yahoo! Auctions) ship within Japan
+# only, so a US buyer goes through a forwarding/proxy service: a service and
+# payment fee (percentage) plus the service's flat fee and international postage
+# for a single ~0.5 kg box (flat). The market side of the deal test is the US
+# price of the same Japanese product (tcgcsv cat 85), which already contains
+# this import premium — so without adding it to the listing side, the ordinary
+# domestic Japanese price reads as a 30-50% "deal" on every single listing
+# (4,800 alerts in 27 days before this was added). These are ESTIMATES: tune them
+# to the forwarding service actually used.
+JP_IMPORT_FEE_PCT  = 0.08
+JP_IMPORT_FLAT_USD = 25.00
+
+
+def jp_import_cost(price_usd: float) -> float:
+    """Estimated cost of importing one Japanese-marketplace box to the US."""
+    return round(price_usd * JP_IMPORT_FEE_PCT + JP_IMPORT_FLAT_USD, 2)
+
 # USD↔JPY conversion for the JP lane (open.er-api.com, free, no key).
 FX_RATE_URL = "https://open.er-api.com/v6/latest/USD"
 FX_RATE_TTL = 6 * 3600               # refresh at most every 6h; stale rate kept on failure

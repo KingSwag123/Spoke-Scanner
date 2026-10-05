@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import api_engines
+import config
+import discord_router
 
 
 class OfficialCardFilterTests(unittest.TestCase):
@@ -75,6 +78,35 @@ class OpenedConditionTests(unittest.TestCase):
             "New/Unopened (JP)", "Unused", "Not specified", "",
         ):
             self.assertFalse(api_engines.is_opened_condition(condition), condition)
+
+
+class JapanImportCostTests(unittest.TestCase):
+    def test_cost_is_percentage_plus_flat(self):
+        self.assertEqual(
+            config.jp_import_cost(100.0),
+            round(100.0 * config.JP_IMPORT_FEE_PCT + config.JP_IMPORT_FLAT_USD, 2),
+        )
+
+    def test_typical_japanese_box_is_no_longer_a_deal(self):
+        # The median Mercari JP alert before this change: $68.73 against a
+        # $108.25 US market price for the same Japanese box.
+        price, market = 68.73, 108.25
+        self.assertLessEqual(price, market * config.DEAL_RATIO)
+        self.assertGreater(price + config.jp_import_cost(price), market * config.DEAL_RATIO)
+
+    def test_a_much_cheaper_box_still_is(self):
+        price, market = 45.0, 108.25
+        self.assertLessEqual(price + config.jp_import_cost(price), market * config.DEAL_RATIO)
+
+    @patch("discord_router._post_embed", return_value=True)
+    def test_sealed_alert_names_the_import_estimate(self, post):
+        discord_router.send_sealed_alert(
+            "ストームエメラルダ BOX", "https://jp.mercari.com/item/m1", 45.0, 28.6, 108.25,
+            "https://example.com/webhook", "pokemon",
+            en_title="Storm Emeralda Booster Box", ship_label="est. import cost",
+        )
+        price_field = post.call_args.args[1]["fields"][0]["value"]
+        self.assertIn("+ $28.60 est. import cost", price_field)
 
 
 class PartialSealedProductTests(unittest.TestCase):

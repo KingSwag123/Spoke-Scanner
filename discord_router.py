@@ -256,18 +256,23 @@ def send_sealed_alert(
     image_url: str = "",
     matched_name: str | None = None,
     en_title: str | None = None,
+    ship_label: str = "ship",
 ) -> bool:
     """Sealed-product deal alert — same market/discount layout as singles.
 
     en_title: English translation/mapping of a Japanese listing title. When
     given, it becomes the headline link and the original JP title is shown
     beneath it in italics.
+
+    ship_label: what the `shipping` amount is called under the price. Japanese
+    marketplace listings pass an estimated import cost, not a quoted shipping
+    charge, and must say so.
     """
     total    = listing_price + shipping
     diff     = market_price - total
     pct      = (diff / market_price * 100) if market_price else 0.0
     color    = _CHANNEL_COLORS.get("sealed", 0x3498DB)
-    ship_str = "free shipping" if shipping <= 0 else f"+ ${shipping:.2f} ship"
+    ship_str = "free shipping" if shipping <= 0 else f"+ ${shipping:.2f} {ship_label}"
     game     = GAME_DISPLAY.get(game_name, game_name.title())
 
     price_row = [

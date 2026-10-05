@@ -46,6 +46,7 @@ from config import (
     MERCARI_JP_QUERIES,
     MERCARI_JP_REQUEST_INTERVAL,
     MERCARI_US_ASSUMED_SHIPPING,
+    jp_import_cost,
     MERCARI_US_QUERIES,
     MERCARI_US_SCAN_INTERVAL,
     SCRAPFLY_API_KEY,
@@ -263,11 +264,14 @@ def fetch_mercari_jp_listings() -> list[dict]:
                 continue
             matched += 1
             thumbs = it.get("thumbnails") or []
+            usd = round(jpy / rate, 2)
             out.append({
                 "item_id":   f"mjp-{item_id}",
                 "title":     title,
-                "price":     round(jpy / rate, 2),
-                "shipping":  0.0,          # JP listings are overwhelmingly 送料込み (shipping incl.)
+                "price":     usd,
+                # Domestic shipping is seller-paid (送料込み, filtered server-side);
+                # what a US buyer still pays is the estimated import cost.
+                "shipping":  jp_import_cost(usd),
                 "url":       f"https://jp.mercari.com/item/{item_id}",
                 "condition": "New/Unopened (JP)",
                 "language":  "Japanese",

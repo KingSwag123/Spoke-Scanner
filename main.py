@@ -504,6 +504,8 @@ def scan_open_market(
                     # show the original Japanese title beneath it.
                     en_title=((matched_name or item.get("en_title"))
                               if item.get("source") in JP_MARKET_SOURCES else None),
+                    ship_label=("est. import cost"
+                                if item.get("source") in JP_MARKET_SOURCES else "ship"),
                 )
                 if sent:
                     mark_seen(item_id, seen)

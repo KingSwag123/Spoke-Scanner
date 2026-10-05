@@ -25,6 +25,7 @@ from config import (
     YAHOO_JP_QUERIES,
     YAHOO_JP_REQUEST_INTERVAL,
     YAHOO_JP_SCAN_INTERVAL,
+    jp_import_cost,
 )
 from mercari_source import _jp_match_en_title, _jpy_per_usd
 
@@ -111,11 +112,14 @@ def fetch_yahoo_jp_listings() -> list[dict]:
                 skipped += 1
                 continue
             matched += 1
+            usd = round(jpy / rate, 2)
             out.append({
                 "item_id":   f"yja-{iid}",
                 "title":     title,
-                "price":     round(jpy / rate, 2),
-                "shipping":  0.0,           # free-shipping listings only (filtered above)
+                "price":     usd,
+                # Domestic shipping is free (filtered above); what a US buyer
+                # still pays is the estimated import cost.
+                "shipping":  jp_import_cost(usd),
                 "url":       f"https://auctions.yahoo.co.jp/jp/auction/{iid}",
                 "condition": "New/Unopened (JP)",
                 "language":  "Japanese",
