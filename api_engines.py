@@ -25,6 +25,7 @@ import requests
 from config import (
     _API_MIN_INTERVAL,
     _BLOCKED_LANGS,
+    _CUSTOM_WORD_RE,
     _FAKE_INDICATORS,
     _FAST_API_HEADERS,
     _FAST_API_INTERVAL,
@@ -42,6 +43,9 @@ from config import (
     _ONEPIECE_INDEX_RETRY,
     _ONEPIECE_INDEX_TTL,
     _OP_CODE_RE,
+    _OPENED_CONDITION_RE,
+    _REPRINT_MARKER_RE,
+    _REPRINT_OWN_TOTALS,
     _SEALED_AMBIG_PRICE_TOL,
     _SEALED_BULK_TOKENS,
     _SEALED_DROP,
@@ -132,7 +136,21 @@ def is_allowed_language(title: str) -> bool:
 def is_official_card(title: str) -> bool:
     """Return False if the title contains any known fake/DIY indicator."""
     t = title.lower()
-    return not any(ind in t for ind in _FAKE_INDICATORS)
+    return not (any(ind in t for ind in _FAKE_INDICATORS) or _CUSTOM_WORD_RE.search(t))
+
+
+def is_anniversary_reprint(title: str, set_total: str) -> bool:
+    """True for an English Pokémon anniversary reprint that keeps an older
+    card's number and set total, which the price lookup would match to the
+    original printing. A set total the anniversary set uses itself is fine."""
+    if not _REPRINT_MARKER_RE.search(title):
+        return False
+    return int(set_total) not in _REPRINT_OWN_TOTALS
+
+
+def is_opened_condition(condition: str) -> bool:
+    """True if an eBay item condition says the product has been opened or used."""
+    return bool(_OPENED_CONDITION_RE.search(condition or ""))
 
 
 # ---------------------------------------------------------------------------

@@ -94,7 +94,9 @@ from api_engines import (
     fetch_price,
     fetch_sealed_price,
     is_allowed_language,
+    is_anniversary_reprint,
     is_official_card,
+    is_opened_condition,
     is_sealed,
     is_yugioh_sealed,
     is_single_card,
@@ -407,6 +409,7 @@ def scan_open_market(
     drop = {
         "floor": 0, "language": 0, "untrusted": 0, "unofficial": 0,
         "lot": 0, "nopricing": 0, "noparse": 0, "seen": 0,
+        "opened": 0, "reprint": 0,
         "nomatch": 0, "nodeal": 0, "sanity": 0, "noslot": 0, "error": 0,
     }
     for item in listings:
@@ -448,6 +451,12 @@ def scan_open_market(
                     or item.get("sealed")):
                 if is_seen(item_id, seen):
                     drop["seen"] += 1
+                    continue
+                # An opened or used box is not sealed product, whatever the title
+                # says. Only eBay reports a comparable item condition.
+                if item.get("source", "ebay") == "ebay" and is_opened_condition(item["condition"]):
+                    drop["opened"] += 1
+                    print(f"  [OPENED]  ${price:.2f} {item['condition']} — {title[:48]}")
                     continue
                 if item.get("source") in JP_MARKET_SOURCES:
                     match = fetch_sealed_price("pokemon_jp", item.get("en_title") or title)
@@ -523,6 +532,16 @@ def scan_open_market(
                 drop["noparse"] += 1
                 continue
 
+            # 6b) English Pokémon anniversary reprints carry the ORIGINAL card's
+            #     number and set total, so the lookup below would price them as
+            #     the original. The Japanese lane prices against its own catalog
+            #     and is unaffected.
+            if (game == "pokemon" and detect_language(title) != "Japanese"
+                    and is_anniversary_reprint(title, parsed[2])):
+                drop["reprint"] += 1
+                print(f"  [REPRINT] ${price:.2f} anniversary reprint — {title[:48]}")
+                continue
+
             # 7) Permanent dedup — before the API call so repeats don't cost lookups.
             if is_seen(item_id, seen):
                 drop["seen"] += 1
@@ -596,6 +615,7 @@ def scan_open_market(
         f"untrusted {drop['untrusted']} | unofficial {drop['unofficial']} | "
         f"lot {drop['lot']} | nopricing {drop['nopricing']} | "
         f"noparse {drop['noparse']} | seen {drop['seen']} | "
+        f"opened {drop['opened']} | reprint {drop['reprint']} | "
         f"nomatch {drop['nomatch']} | nodeal {drop['nodeal']} | "
         f"sanity {drop['sanity']} | noslot {drop['noslot']} | error {drop['error']} | "
         f"RESTOCK {restock_alerts} | SEALED {sealed_alerts} | DEALS {deals}"

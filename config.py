@@ -407,7 +407,32 @@ _FAKE_INDICATORS = {
     "3d print", "bootleg", "homemade", "unofficial",
     "gold foil fan", "foil fan art", "not official", "custom made",
     "custom printed", "novelty", "altered art",
+    # Official-but-different products that carry a real card's name and number
+    # and would otherwise be priced as the standard card: oversized promo cards
+    # ("oversize" also covers "oversized") and acrylic display cases sold with
+    # extended artwork. Plain "extended art" is NOT listed — it is a genuine
+    # Magic card treatment.
+    "jumbo", "oversize", "display case", "extended art case", "extended artwork",
 }
+
+# "custom" as a whole word (custom artwork, custom holo, …). Word-bounded so
+# "customs" and "customer" in a title never trip it.
+_CUSTOM_WORD_RE = re.compile(r"\bcustom\b", re.IGNORECASE)
+
+# English Pokémon anniversary sets reprint older cards and KEEP the original
+# card number and set total (e.g. the 30th Anniversary "Dark Tyranitar 19/109").
+# The price lookup pins a card by number + set total, so such a reprint lands on
+# the original printing's price and fires a false deal. Celebrations' own cards
+# are numbered x/25 and match correctly, so that total is exempt.
+_REPRINT_MARKER_RE = re.compile(
+    r"\b(?:25th|30th)\s+anniv(?:ersary)?\b|\bclassic collection\b|\bcelebrations\b",
+    re.IGNORECASE,
+)
+_REPRINT_OWN_TOTALS = {25}
+
+# eBay item conditions that mean a "sealed" product has been opened. Word-bounded
+# so "Unopened" and "Unused" do not count.
+_OPENED_CONDITION_RE = re.compile(r"\b(?:used|open box|opened|pre-owned)\b", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
