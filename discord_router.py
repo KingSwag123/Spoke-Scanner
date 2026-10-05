@@ -257,6 +257,7 @@ def send_sealed_alert(
     matched_name: str | None = None,
     en_title: str | None = None,
     ship_label: str = "ship",
+    note: str | None = None,
 ) -> bool:
     """Sealed-product deal alert — same market/discount layout as singles.
 
@@ -267,6 +268,10 @@ def send_sealed_alert(
     ship_label: what the `shipping` amount is called under the price. Japanese
     marketplace listings pass an estimated import cost, not a quoted shipping
     charge, and must say so.
+
+    note: a one-line caution shown under the headline (e.g. the seller's title
+    mentions damage). Kept in the description, not a field: the history sync
+    reads fields by name.
     """
     total    = listing_price + shipping
     diff     = market_price - total
@@ -295,7 +300,8 @@ def send_sealed_alert(
     embed = {
         "title":       f"📦  {game} Deal — Sealed Product",
         "description": (f"### [{en_title}]({url})\n*🇯🇵 {title}*"
-                        if en_title else f"### [{title}]({url})"),
+                        if en_title else f"### [{title}]({url})")
+                       + (f"\n⚠️ **{note}**" if note else ""),
         "url":         url,
         "color":       color,
         "fields":      price_row + [divider] + meta_row,

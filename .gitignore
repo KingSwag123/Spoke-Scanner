@@ -11,3 +11,6 @@ watchlists.db
 watchlists.db-shm
 watchlists.db-wal
 sold_comps_cache*.json
+
+# Live repeat-limit state (posted alerts per product, last 24h). Runtime only.
+product_alerts.json

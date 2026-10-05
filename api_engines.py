@@ -26,6 +26,10 @@ from config import (
     _API_MIN_INTERVAL,
     _ART_CASE_RE,
     _BLOCKED_LANGS,
+    _COND_FLAW_RE,
+    _COND_NEG_RE,
+    _COND_POINTER_RE,
+    _COND_WEIGHT_RE,
     _CUSTOM_WORD_RE,
     _FAKE_INDICATORS,
     _FAST_API_HEADERS,
@@ -41,19 +45,29 @@ from config import (
     _NAME_NOISE,
     _NAME_STOPWORDS,
     _NAME_SUFFIX,
+    _NOT_PRESALE_RE,
     _ONEPIECE_INDEX_RETRY,
     _ONEPIECE_INDEX_TTL,
     _OP_CODE_RE,
     _OPENED_CONDITION_RE,
     _OVERSIZE_INDICATORS,
+    _PRESALE_RE,
     _REPRINT_MARKER_RE,
     _REPRINT_OWN_TOTALS,
+    _SEALED_ALIAS,
     _SEALED_AMBIG_PRICE_TOL,
     _SEALED_BULK_TOKENS,
     _SEALED_DROP,
+    _SEALED_DROP_BY_GAME,
+    _SEALED_ERA_SETS,
+    _SEALED_FORM_TOKENS,
     _SEALED_INDEX_RETRY,
     _SEALED_INDEX_TTL,
     _SEALED_INDICATORS,
+    _SEALED_LANG_RE,
+    _SEALED_LANG_WORDS,
+    _SEALED_LOT_EXEMPT_RE,
+    _SEALED_LOT_RE,
     _SEALED_MIN_TOKENS,
     _SEALED_PACK_COUNT_RE,
     _SEALED_PARTIAL_TOKENS,
@@ -66,6 +80,10 @@ from config import (
     MIN_SELLER_FEEDBACK_PCT,
     MIN_SELLER_FEEDBACK_SCORE,
     POKEMON_TCG_URL,
+    SEALED_PACK_COUNT_MAX,
+    SEALED_PACK_COUNT_MAX_DEFAULT,
+    SEALED_REPEAT_FREE,
+    SEALED_REPEAT_WINDOW,
     TCGCSV_CATEGORY,
     TCGCSV_ONEPIECE_CAT,
     TCGCSV_POKEMON_JP_CAT,
@@ -164,6 +182,58 @@ def is_anniversary_reprint(title: str, set_total: str) -> bool:
 def is_opened_condition(condition: str) -> bool:
     """True if an eBay item condition says the product has been opened or used."""
     return bool(_OPENED_CONDITION_RE.search(condition or ""))
+
+
+def sealed_language_mismatch(title: str, matched_name: str) -> bool:
+    """A sealed listing that says it is non-English, matched to a catalog
+    product whose own name does not. Callers must exempt the Japanese-marketplace
+    lane, which is Japanese by design and priced on the Japanese catalog."""
+    if _sealed_tokens(matched_name) & _SEALED_LANG_WORDS:
+        return False
+    return detect_language(title) == "Japanese" or bool(_SEALED_LANG_RE.search(_ascii(title)))
+
+
+def is_sealed_lot(title: str, matched_name: str) -> bool:
+    """True if the title states a quantity of whole units ("2x", "3 boxes") that
+    would be priced as one unit of the matched product."""
+    if _SEALED_LOT_EXEMPT_RE.search(matched_name) or _SEALED_LOT_RE.search(_ascii(matched_name)):
+        return False
+    return bool(_SEALED_LOT_RE.search(_ascii(title)))
+
+
+def is_presale(title: str) -> bool:
+    """True if the title says the item is a presale / pre-order."""
+    t = _ascii(title)
+    return bool(_PRESALE_RE.search(t)) and not _NOT_PRESALE_RE.search(t)
+
+
+def sealed_condition_caveat(title: str, matched_name: str) -> str | None:
+    """"flaw", "weight" or "pointer" if the title carries a condition note (torn
+    seal, weighed pack, "read description"), else None."""
+    t = _COND_NEG_RE.sub(" ", _ascii(title))
+    own = _sealed_tokens(matched_name)
+    for tier, rx in (("flaw", _COND_FLAW_RE), ("weight", _COND_WEIGHT_RE),
+                     ("pointer", _COND_POINTER_RE)):
+        for m in rx.finditer(t):
+            words = set(re.findall(r"[a-z]+", m.group(0).lower()))
+            if words and words <= own:
+                continue                  # part of the product's own name
+            return tier
+    return None
+
+
+def repeat_allowed(recent: dict, key: str, total: float, now: float) -> bool:
+    """Repeat limit for one catalog product. Its first SEALED_REPEAT_FREE alerts
+    inside SEALED_REPEAT_WINDOW always post; after that a listing posts only if
+    it is cheaper than every alert already posted for the product in the window.
+    `recent` maps key -> [[epoch_seconds, total], ...] of posted alerts; expired
+    entries for `key` are dropped here."""
+    hist = [p for p in recent.get(key, []) if now - p[0] < SEALED_REPEAT_WINDOW]
+    if hist:
+        recent[key] = hist
+    else:
+        recent.pop(key, None)
+    return len(hist) < SEALED_REPEAT_FREE or total < min(p[1] for p in hist)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,12 +1141,51 @@ def fetch_japanese_price(species: str, number: str, set_total: str):
 _sealed_index: dict[str, list]  = {}    # game -> [(frozenset(tokens), price, name)]
 _sealed_until: dict[str, float] = {}    # game -> monotonic deadline (TTL / backoff)
 _sealed_idf:   dict[str, dict]  = {}    # game -> {token: distinctiveness weight}
+_sealed_sets:  dict[str, set]   = {}    # game -> {frozenset(expansion-name tokens)}
 
 
-def _sealed_tokens(name: str) -> frozenset[str]:
-    """Lowercase alnum tokens of a name, minus brand/filler words."""
+def _sealed_tokens(name: str, game: str = "") -> frozenset[str]:
+    """Lowercase alnum tokens of a name, minus brand/filler words (and the
+    words that are filler only in `game`'s own catalog)."""
     toks = re.findall(r"[a-z0-9]+", _ascii(name).lower())
-    return frozenset(t for t in toks if t not in _SEALED_DROP)
+    extra = _SEALED_DROP_BY_GAME.get(game, frozenset())
+    return frozenset(t for t in toks if t not in _SEALED_DROP and t not in extra)
+
+
+def _sealed_set_name(toks: frozenset, game: str) -> frozenset:
+    """A product's tokens minus form words and its era name: what is left names
+    the expansion ("surging sparks"). Empty for an era-level product."""
+    name = toks - _SEALED_FORM_TOKENS
+    for era in _SEALED_ERA_SETS.get(game, ()):
+        if era <= toks:
+            name = name - era
+    return frozenset(name)
+
+
+def _sealed_is_era_level(toks: frozenset, game: str) -> bool:
+    """True for a product named only by an era and form words."""
+    return (any(era <= toks for era in _SEALED_ERA_SETS.get(game, ()))
+            and not _sealed_set_name(toks, game))
+
+
+def _sealed_set_names(idx: list, game: str) -> set:
+    """Expansion names in a game's index, used to tell when a title names a
+    specific set. Only booster and Elite Trainer Box products count, so product
+    names like "Charizard ex Box" cannot make "Charizard ex" a set name."""
+    eras = _SEALED_ERA_SETS.get(game, ())
+    if not eras:
+        return set()
+    era_words = frozenset().union(*eras)
+    out: set = set()
+    for toks, _price, _name in idx:
+        if not ("booster" in toks or {"elite", "trainer"} <= toks):
+            continue
+        if any(era <= toks for era in eras):
+            continue
+        name = _sealed_set_name(toks, game)
+        if name and not name <= era_words and any(len(t) >= 3 for t in name):
+            out.add(name)
+    return out
 
 
 def _build_sealed_index(game: str):
@@ -1122,7 +1231,7 @@ def _build_sealed_index(game: str):
             if not mp:
                 continue
             name = prod.get("name", "")
-            toks = _sealed_tokens(name)
+            toks = _sealed_tokens(name, game)
             if len(toks) < _SEALED_MIN_TOKENS:
                 continue
             # Skip bulk container SKUs (Case/Display) — their 10×+ price makes a
@@ -1156,6 +1265,7 @@ def _sealed_idx(game: str) -> list:
     if idx:
         _sealed_index[game] = idx
         _sealed_idf[game]   = idf
+        _sealed_sets[game]  = _sealed_set_names(idx, game)
         _sealed_until[game] = now + _SEALED_INDEX_TTL
         print(f"[INFO] {game} sealed index ready — {len(idx)} products priced")
     else:
@@ -1165,16 +1275,21 @@ def _sealed_idx(game: str) -> list:
     return _sealed_index.get(game, [])
 
 
-def _sealed_title_is_partial(title: str, title_toks: set, product_toks: frozenset) -> bool:
-    """True if the title describes less than the matched product: a partial-
-    product word the product itself lacks, or a small pack count on a booster
-    box. Only booster boxes: an Elite Trainer Box really does hold "9 packs"."""
-    if (title_toks & _SEALED_PARTIAL_TOKENS) - product_toks:
+def _sealed_title_is_partial(title: str, title_toks: set, product_toks: frozenset,
+                             game: str = "") -> bool:
+    """True if the title describes something other than one unit of the matched
+    product: a partial-product, other-form or lot word the product itself lacks,
+    or a small pack count on a booster box. Only booster boxes: an Elite Trainer
+    Box really does hold "9 packs"."""
+    words = title_toks | ({"elite"} if "etb" in title_toks else set())
+    if (words & _SEALED_PARTIAL_TOKENS) - product_toks:
         return True
-    # Magic Collector Booster Boxes genuinely hold as few as 4 packs.
-    return bool({"booster", "box"} <= product_toks
-                and not {"pack", "collector"} & product_toks
-                and _SEALED_PACK_COUNT_RE.search(title))
+    # Collector Booster Boxes genuinely hold as few as 4 packs, and a Half
+    # Booster Box 18.
+    if not {"booster", "box"} <= product_toks or {"pack", "collector", "half"} & product_toks:
+        return False
+    limit = SEALED_PACK_COUNT_MAX.get(game, SEALED_PACK_COUNT_MAX_DEFAULT)
+    return any(int(m.group(1)) <= limit for m in _SEALED_PACK_COUNT_RE.finditer(title))
 
 
 def fetch_sealed_price(game: str, title: str):
@@ -1191,10 +1306,16 @@ def fetch_sealed_price(game: str, title: str):
         return None
     idf = _sealed_idf.get(game, {})
     title_toks = set(re.findall(r"[a-z0-9]+", _ascii(title).lower()))
+    title_toks |= {_SEALED_ALIAS[t] for t in title_toks if t in _SEALED_ALIAS}
+    # A title that names a specific expansion must not fall back to the era-level
+    # product ("Scarlet & Violet Booster Box") when that expansion's own product
+    # is missing or loses on tokens.
+    names_a_set = any(s <= title_toks for s in _sealed_sets.get(game, ()))
     scored = [
         (sum(idf.get(t, 0.0) for t in toks), len(toks), price, name, toks)
         for toks, price, name in idx
         if toks <= title_toks
+        and not (names_a_set and _sealed_is_era_level(toks, game))
     ]
     if not scored:
         return None
@@ -1203,7 +1324,7 @@ def fetch_sealed_price(game: str, title: str):
     # depending on index insertion order.
     scored.sort(key=lambda x: (-x[0], -x[1], x[3]))
     best_score, _best_ntoks, best_price, best_name, best_toks = scored[0]
-    if _sealed_title_is_partial(title, title_toks, best_toks):
+    if _sealed_title_is_partial(title, title_toks, best_toks, game):
         return None
     # Ambiguity guard: a different product tied at the top score with a materially
     # different price means we can't tell them apart — don't guess.

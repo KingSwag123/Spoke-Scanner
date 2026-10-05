@@ -79,3 +79,10 @@ CREATE TABLE IF NOT EXISTS watch_targeted_search_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_watch_targeted_search_jobs_due
     ON watch_targeted_search_jobs(next_attempt);
+-- The scanner's "already alerted" listing ids (see scanner_state.py). The JSON
+-- file that holds them does not survive a republish, so without this table
+-- every listing still in the feeds alerts again after each publish.
+CREATE TABLE IF NOT EXISTS scanner_seen (
+    item_id TEXT PRIMARY KEY,
+    seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

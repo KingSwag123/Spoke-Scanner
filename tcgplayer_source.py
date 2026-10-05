@@ -17,7 +17,9 @@ Swept on an interval (default 30 min), newest sets first — that's where the
 supply/demand gaps show up.
 """
 
+import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -43,6 +45,32 @@ _PAGE_PAUSE = 1.5        # polite spacing between API page requests (s)
 # dedups unless the price actually changed.
 _best_emitted: dict[int, float] = {}
 _IMPROVE_RATIO = 0.95    # must be >=5% cheaper than the last alerted price
+_BEST_MEMORY_DAYS = 7    # how far back seed_best_emitted() reads alerted prices
+_SEEN_ID_RE = re.compile(r"tcgp-(\d+)-(\d+)")
+
+
+def seed_best_emitted(seen: dict) -> int:
+    """Rebuild _best_emitted from the dedup store after a restart.
+
+    Alerted TCGplayer listings are stored as "tcgp-<productId>-<cents>" with the
+    time they alerted, so the lowest price alerted for each product in the last
+    _BEST_MEMORY_DAYS can be recovered. Without this every restart forgot the
+    baseline and re-alerted products at prices already posted. Returns the
+    number of products seeded."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_BEST_MEMORY_DAYS)
+    for item_id, stamp in seen.items():
+        m = _SEEN_ID_RE.fullmatch(item_id)
+        if not m:
+            continue
+        try:
+            if datetime.fromisoformat(stamp) < cutoff:
+                continue
+        except (TypeError, ValueError):
+            continue
+        pid, total = int(m.group(1)), int(m.group(2)) / 100
+        best = _best_emitted.get(pid)
+        _best_emitted[pid] = total if best is None else min(best, total)
+    return len(_best_emitted)
 
 
 def _search_page(product_line: str, offset: int) -> list[dict]:

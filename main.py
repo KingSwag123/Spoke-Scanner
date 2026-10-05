@@ -76,6 +76,9 @@ from config import (
     YAHOO_JP_SCAN_INTERVAL,
     RESTOCK_WEBHOOK,
     SCRAPFLY_API_KEY,
+    PRODUCT_ALERTS_FILE,
+    SEALED_REPEAT_FREE,
+    SEALED_REPEAT_WINDOW,
     SEALED_SANITY_FLOOR,
     SEEN_EXPIRY_DAYS,
     SEEN_FILE,
@@ -97,12 +100,17 @@ from api_engines import (
     is_anniversary_reprint,
     is_official_card,
     is_opened_condition,
+    is_presale,
     is_sealed,
+    is_sealed_lot,
     is_yugioh_sealed,
     is_single_card,
     is_trusted_seller,
     parse_title,
+    repeat_allowed,
     reset_cycle_cache,
+    sealed_condition_caveat,
+    sealed_language_mismatch,
 )
 from discord_router import (
     determine_channel,
@@ -116,7 +124,16 @@ from discord_router import (
 # English sealed catalog.
 JP_MARKET_SOURCES = {"mercari_jp", "yahoo_jp"}
 
-from tcgplayer_source import fetch_tcgplayer_listings
+# Shown under the headline of a sealed alert whose title carries a condition
+# note (api_engines.sealed_condition_caveat). The listing still posts.
+_CAVEAT_NOTES = {
+    "flaw":    "Seller's title mentions damage or an opened seal",
+    "weight":  "Seller's title says the pack was weighed",
+    "pointer": "Seller's title says to read the description",
+}
+
+import scanner_state
+from tcgplayer_source import fetch_tcgplayer_listings, seed_best_emitted
 from yahoo_source import fetch_yahoo_jp_listings
 from mercari_source import (
     fetch_mercari_jp_listings,
@@ -137,8 +154,7 @@ from watchlist_bot import WatchlistBot, create_watchlist_bot
 # Seen-listings store (permanent per-listing dedup)
 # ---------------------------------------------------------------------------
 
-def load_seen() -> dict:
-    """Load {item_id: iso_timestamp} from disk."""
+def _load_seen_file() -> dict:
     if Path(SEEN_FILE).exists():
         try:
             with open(SEEN_FILE) as f:
@@ -146,6 +162,24 @@ def load_seen() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
     return {}
+
+
+def load_seen() -> dict:
+    """Load {item_id: iso_timestamp}: the local file, plus — on the live
+    instance — the durable copy in the database (see scanner_state). The file
+    alone does not survive a republish; ids found only in the file are copied
+    into the database so the first start with the table loses nothing."""
+    seen = cleanup_seen(_load_seen_file())
+    if POST_TO_DISCORD:
+        stored = scanner_state.load_seen(SEEN_EXPIRY_DAYS)
+        if stored is not None:
+            only_in_file = {k: v for k, v in seen.items() if k not in stored}
+            scanner_state.add_seen(only_in_file)
+            print(f"[START] Dedup store: {len(stored)} id(s) from the database, "
+                  f"{len(only_in_file)} more from the local file")
+            return {**seen, **stored}
+    print(f"[START] Dedup store: {len(seen)} id(s) from the local file")
+    return seen
 
 
 def save_seen(seen: dict) -> None:
@@ -160,6 +194,9 @@ def is_seen(item_id: str, seen: dict) -> bool:
 
 def mark_seen(item_id: str, seen: dict) -> None:
     seen[item_id] = datetime.now(timezone.utc).isoformat()
+    # Durable copy first (never raises), so a file error cannot keep the id out
+    # of the database.
+    scanner_state.add_seen({item_id: seen[item_id]})
     # Write-through: persist immediately so a mid-cycle restart/crash can never
     # re-alert an item already sent (the end-of-cycle save alone loses sends
     # from a partial cycle and causes duplicate pings on the next run).
@@ -177,6 +214,37 @@ def cleanup_seen(seen: dict) -> dict:
         except (ValueError, TypeError):
             out[k] = v
     return out
+
+
+def load_product_alerts() -> dict:
+    """Load the repeat-limit state {product_key: [[epoch, total], ...]}. Anything
+    malformed starts empty — the limit then fails open (alerts post)."""
+    try:
+        with open(PRODUCT_ALERTS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    ok = isinstance(data, dict) and all(
+        isinstance(entries, list) and all(
+            isinstance(e, list) and len(e) == 2
+            and all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in e)
+            for e in entries)
+        for entries in data.values())
+    return data if ok else {}
+
+
+def save_product_alerts(product_alerts: dict) -> None:
+    """Persist the repeat-limit state, dropping products with no alert left in
+    the window. A write error must never cost an alert."""
+    cutoff = time.time() - SEALED_REPEAT_WINDOW
+    for key in [k for k, entries in product_alerts.items()
+                if not any(e[0] > cutoff for e in entries)]:
+        del product_alerts[key]
+    try:
+        with open(PRODUCT_ALERTS_FILE, "w") as f:
+            json.dump(product_alerts, f)
+    except OSError as e:
+        print(f"  [WARN] could not save {PRODUCT_ALERTS_FILE}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +361,10 @@ def scan_open_market(
     seen: dict,
     availability: dict,
     watchlist_bot: WatchlistBot | None = None,
+    product_alerts: dict | None = None,
 ) -> None:
+    if product_alerts is None:
+        product_alerts = {}
     reset_cycle_cache()   # evict expired price-cache entries (prices persist across cycles via TTL)
     t_start = time.monotonic()
 
@@ -409,7 +480,7 @@ def scan_open_market(
     drop = {
         "floor": 0, "language": 0, "untrusted": 0, "unofficial": 0,
         "lot": 0, "nopricing": 0, "noparse": 0, "seen": 0,
-        "opened": 0, "reprint": 0,
+        "opened": 0, "reprint": 0, "presale": 0, "sealedlot": 0, "repeat": 0,
         "nomatch": 0, "nodeal": 0, "sanity": 0, "noslot": 0, "error": 0,
     }
     for item in listings:
@@ -458,6 +529,11 @@ def scan_open_market(
                     drop["opened"] += 1
                     print(f"  [OPENED]  ${price:.2f} {item['condition']} — {title[:48]}")
                     continue
+                # A presale's "saving" is measured against a pre-release price and
+                # was wrong far more often than right (see config._PRESALE_RE).
+                if item.get("source") not in JP_MARKET_SOURCES and is_presale(title):
+                    drop["presale"] += 1
+                    continue
                 if item.get("source") in JP_MARKET_SOURCES:
                     match = fetch_sealed_price("pokemon_jp", item.get("en_title") or title)
                 else:
@@ -475,6 +551,21 @@ def scan_open_market(
                     drop["nomatch"] += 1
                     print(f"  [SKUMISMATCH] tcgcsv ${market_price:.2f} vs API ${src_market:.2f} — {title[:44]}")
                     continue
+                # Title guards that need the matched product. Not for the Japanese
+                # lane (its "title" is Japanese by design and matched through a
+                # pre-mapped English phrase) nor TCGplayer (its title IS the
+                # catalog product name).
+                caveat = None
+                if item.get("source") not in JP_MARKET_SOURCES and item.get("source") != "tcgplayer":
+                    if sealed_language_mismatch(title, matched_name):
+                        drop["language"] += 1
+                        print(f"  [LANGUAGE] non-English sealed vs English catalog — {title[:48]}")
+                        continue
+                    if is_sealed_lot(title, matched_name):
+                        drop["sealedlot"] += 1
+                        print(f"  [LOT]     ${price:.2f} multi-unit listing — {title[:48]}")
+                        continue
+                    caveat = sealed_condition_caveat(title, matched_name)
                 # Japanese-marketplace listings carry an estimated cost of importing
                 # the box (config.jp_import_cost). It counts toward the deal test —
                 # the market side is the US price — but it is not part of what the
@@ -501,6 +592,25 @@ def scan_open_market(
                     drop["noslot"] += 1
                     print(f"  [SKIP] empty slot #{game}/{channel} — {title[:48]}")
                     continue
+                # Repeat limit per catalog product (config.SEALED_REPEAT_FREE). It
+                # runs last so a listing dropped above never uses one of the
+                # product's slots or sets its low. A listing with a condition note
+                # is keyed apart: a damaged box must not hide clean ones.
+                pkey = (("pokemon_jp" if item.get("source") in JP_MARKET_SOURCES else game)
+                        + "|" + matched_name + ("|caveat" if caveat else ""))
+                try:
+                    repeat_ok = repeat_allowed(product_alerts, pkey, total, time.time())
+                except Exception as e:      # bad state must never cost an alert
+                    print(f"  [WARN] repeat limit skipped — {type(e).__name__}: {e}")
+                    repeat_ok = True
+                if not repeat_ok:
+                    drop["repeat"] += 1
+                    print(f"  [REPEAT]  ${total:.2f} not below today's alerts — {matched_name[:40]}")
+                    # Judged once. A Shopify variant keeps its id while it stays
+                    # in stock, so leave it free to post when a slot opens.
+                    if item.get("source") != "shopify":
+                        mark_seen(item_id, seen)
+                    continue
                 print(f"  [SEALED] ${total:.2f} vs mkt ${market_price:.2f} → #{game}/{channel} — {title[:48]}")
                 sent = send_sealed_alert(
                     title, item["url"], price, shipping + import_cost, market_price,
@@ -515,10 +625,13 @@ def scan_open_market(
                     en_title=((matched_name or item.get("en_title"))
                               if item.get("source") in JP_MARKET_SOURCES else None),
                     ship_label="est. import cost" if import_cost else "ship",
+                    note=_CAVEAT_NOTES.get(caveat),
                 )
                 if sent:
                     mark_seen(item_id, seen)
                     sealed_alerts += 1
+                    product_alerts.setdefault(pkey, []).append([time.time(), total])
+                    save_product_alerts(product_alerts)
                 continue
 
             # 4) Single cards: authenticity + lot safeguards.
@@ -627,6 +740,7 @@ def scan_open_market(
         f"lot {drop['lot']} | nopricing {drop['nopricing']} | "
         f"noparse {drop['noparse']} | seen {drop['seen']} | "
         f"opened {drop['opened']} | reprint {drop['reprint']} | "
+        f"presale {drop['presale']} | sealedlot {drop['sealedlot']} | repeat {drop['repeat']} | "
         f"nomatch {drop['nomatch']} | nodeal {drop['nodeal']} | "
         f"sanity {drop['sanity']} | noslot {drop['noslot']} | error {drop['error']} | "
         f"RESTOCK {restock_alerts} | SEALED {sealed_alerts} | DEALS {deals}"
@@ -721,6 +835,11 @@ def main() -> None:
               f"sealed restock + below-market (USD)\n")
 
     seen = load_seen()
+    product_alerts = load_product_alerts()
+    seeded = seed_best_emitted(seen)
+    print(f"[START] Repeat limit: {SEALED_REPEAT_FREE} alerts per sealed product per "
+          f"{SEALED_REPEAT_WINDOW // 3600}h, then new lows only; "
+          f"TCGplayer baseline restored for {seeded} product(s)")
     availability = load_availability()
     watchlist_bot: WatchlistBot | None = None
     if DISCORD_BOT_TOKEN and POST_TO_DISCORD:
@@ -748,7 +867,7 @@ def main() -> None:
         try:
             seen = cleanup_seen(seen)
             availability = cleanup_availability(availability)
-            scan_open_market(seen, availability, watchlist_bot)
+            scan_open_market(seen, availability, watchlist_bot, product_alerts)
         except Exception as e:
             print(f"[ERROR] {e}")
 

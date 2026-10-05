@@ -37,6 +37,18 @@ _STATE_SUFFIX = "" if _DISCORD_LIVE else ".local"
 # Config
 # ---------------------------------------------------------------------------
 SEEN_FILE        = f"seen_listings{_STATE_SUFFIX}.json"   # permanent dedup state; .local in dry-run
+
+# Repeat limit for sealed alerts. Hot products (a new set's Elite Trainer Box)
+# get dozens of listings a day that all clear the deal test, because the catalog
+# price sits above the going price. Each product's first SEALED_REPEAT_FREE
+# alerts in SEALED_REPEAT_WINDOW post as usual; after that only a listing
+# cheaper than everything already posted for it in the window does. On 30 days
+# of history this hid 2,200 of 5,000 sealed alerts while the day's cheapest
+# listing of a product still posted on 97% of days.
+#   {"<catalog>|<product>": [[epoch_seconds, total], ...]} — posted alerts only.
+PRODUCT_ALERTS_FILE  = f"product_alerts{_STATE_SUFFIX}.json"
+SEALED_REPEAT_FREE   = 3
+SEALED_REPEAT_WINDOW = 24 * 3600
 WATCHLIST_DB_FILE = os.environ.get("WATCHLIST_DB_FILE", "watchlists.db")
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 SOLD_COMPS_CACHE_FILE = f"sold_comps_cache{_STATE_SUFFIX}.json"
@@ -657,7 +669,34 @@ _SEALED_MIN_TOKENS  = 3           # require this many distinctive tokens to matc
 _SEALED_DROP = {
     "the", "of", "a", "an", "and", "tcg", "ccg", "trading", "card", "game",
     "games", "sealed", "new", "english", "edition", "factory", "disney",
-    "lorcana", "pokemon", "pokémon", "magic", "gathering", "mtg", "one", "piece",
+    "lorcana", "pokemon", "pokémon", "magic", "gathering", "mtg",
+}
+# Brand words dropped for ONE game's catalog only. "one" and "piece" are filler in
+# One Piece product names, but elsewhere "one" is distinctive: with it dropped,
+# "Play! Pokemon Prize Pack Series One" matched every other Prize Pack series.
+_SEALED_DROP_BY_GAME = {"onepiece": frozenset({"one", "piece"})}
+
+# Seller spellings read as the catalog's, in listing TITLES only (added next to
+# the original word, never replacing it). Sellers write "30th Celebrations" for
+# the 2026 set the catalog calls "30th Celebration"; without this the title is
+# not a superset of the 2026 product's tokens and falls through to the 2021
+# "Celebrations" product at more than twice the price.
+_SEALED_ALIAS = {"celebrations": "celebration"}
+
+# Words that name a product FORM, plus per-game era names. A catalog product
+# whose name is nothing but an era and form words ("Scarlet & Violet Booster
+# Box") is era-level: it must not match a listing whose title names a specific
+# expansion ("Scarlet & Violet Surging Sparks Booster Box").
+_SEALED_FORM_TOKENS = {
+    "booster", "box", "pack", "bundle", "display", "elite", "trainer", "blister",
+    "tin", "deck", "collection", "set", "base", "case", "s",
+}
+_SEALED_ERA_SETS = {
+    "pokemon": tuple(frozenset(e) for e in (
+        ("scarlet", "violet"), ("sword", "shield"), ("sun", "moon"),
+        ("mega", "evolution"), ("xy",), ("black", "white"),
+        ("heartgold", "soulsilver"), ("diamond", "pearl"),
+    )),
 }
 
 # Bulk / wholesale container SKUs. A "Case" holds ~6-12 retail units, so its market
@@ -674,14 +713,98 @@ _SEALED_BULK_TOKENS = {"case"}
 # ("Booster Box ... Mini", "Booster Box Token Card", "EMPTY Booster Box"). The
 # subset match ignores extra title words, so without this such a listing is priced
 # as the full product. Allowed when the matched product carries the word itself
-# (a "Mini Tin" is a real product).
-_SEALED_PARTIAL_TOKENS = {"mini", "token", "empty"}
+# (a "Mini Tin" is a real product). The same test catches a DIFFERENT product
+# form of the right set priced as a plain booster box: a "Half Booster Box", an
+# Elite Trainer Box (sellers' "ETB" is read as "elite"), a "Booster Bundle", a
+# "Collector Booster Box". And a listing that is a LOT of several units.
+_SEALED_PARTIAL_TOKENS = {
+    "mini", "token", "empty", "half", "elite", "bundle", "collector", "lot",
+}
 
-# A small pack count in the title ("4 Pack", "3-pack", "3 Booster Packs", "6pk")
-# while the matched product is a booster box. Counts of 10+ are left alone:
-# sellers routinely write "36 Packs" on a genuine booster box.
+# A small pack count in the title ("4 Pack", "3-pack", "3 Booster Packs", "6pk",
+# "18 Packs") while the matched product is a booster box. Up to 19 so a half box
+# is caught; Magic stops at 9 (see SEALED_PACK_COUNT_MAX) because its boxes
+# genuinely come in 12-18 packs. Larger counts are left alone: sellers routinely
+# write "36 Packs" on a genuine booster box. A number glued to a set code
+# ("OP-11 Booster Pack") or a "#" is not a count.
 _SEALED_PACK_COUNT_RE = re.compile(
-    r"\b([1-9])\s*-?\s*(?:booster\s+)?(?:packs?|pks?)(?![a-z])", re.IGNORECASE
+    r"(?<![A-Za-z0-9]-)(?<!#)\b(1[0-9]|[1-9])\s*-?\s*(?:booster\s+)?(?:packs?|pks?)(?![a-z])",
+    re.IGNORECASE,
+)
+SEALED_PACK_COUNT_MAX = {"mtg": 9}
+SEALED_PACK_COUNT_MAX_DEFAULT = 19
+
+# A sealed listing that says it is a non-English product. English catalogs price
+# English product; a Japanese / Korean / … box is a different, usually cheaper
+# item. (Japanese is also detected by api_engines.detect_language.)
+_SEALED_LANG_RE = re.compile(
+    r"\b(?:jap|kor|korean|ita|italian|russian|rus|chinese|chn|german|deutsch|french"
+    r"|francais|spanish|espanol|portuguese|thai|indonesian)\b",
+    re.IGNORECASE,
+)
+_SEALED_LANG_WORDS = {
+    "japanese", "japan", "jpn", "jp", "jap", "kor", "korean", "ita", "italian",
+    "russian", "rus", "chinese", "chn", "german", "deutsch", "french", "francais",
+    "spanish", "espanol", "portuguese", "thai", "indonesian",
+}
+
+# A stated quantity of whole units ("2x", "x3", "3 boxes", "2box", "2 ETBs") —
+# not a count of packs or cards inside one product ("x36 packs"). The word "lot"
+# itself is in _SEALED_PARTIAL_TOKENS.
+_LOT_NOT_PACKS = (r"(?!\s*(?:\w+\s+){0,2}?"
+                  r"(?:booster\s+packs?|packs?|pks?|boosters|cards?|promos?)\b)")
+_SEALED_LOT_RE = re.compile(
+    r"(?<![a-z0-9-])(?:[2-9]|1\d)\s*x(?![a-z0-9])" + _LOT_NOT_PACKS +
+    r"|(?<![a-z0-9])x\s*(?:[2-9]|1\d)(?![a-z0-9-])" + _LOT_NOT_PACKS +
+    r"|(?<![a-z0-9-])(?:[2-9]|1[0-2]|two|three|four|five|six)\s*(?:boxes|etbs\b|etb's)"
+    r"(?!\s+(?:available|left|in\s+stock))"
+    r"|(?<![a-z0-9-])(?:[2-9]|1[0-2])box\b",
+    re.IGNORECASE,
+)
+_SEALED_LOT_EXEMPT_RE = re.compile(r"\b(?:display|case|set of)\b", re.IGNORECASE)
+
+# Presale / pre-order wording. The saving shown on a presale is against a
+# pre-release price: of 131 presale alerts that could be checked later, 114 were
+# priced ABOVE what the product then sold for. "Prerelease" (a real Magic
+# product) deliberately does not match.
+_PRESALE_RE = re.compile(
+    r"\bpre[\s-]?(?:sale|order|sell)|\bexpected release\b"
+    r"|\bships?\s+(?:in\s+|on\s+|by\s+|after\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?"
+    r"|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?"
+    r"|nov(?:ember)?|dec(?:ember)?)\.?(?![a-z])(?!\s+of\b)",
+    re.IGNORECASE,
+)
+_NOT_PRESALE_RE = re.compile(r"\b(?:not?|non)\s+(?:a\s+)?pre[\s-]?(?:sale|order|sell)", re.IGNORECASE)
+
+# Condition notes in a sealed listing's TITLE. Such a listing is the right
+# product priced down for a stated flaw, so the alert is posted with a note
+# rather than hidden. Negations ("no rips or tears", "never opened") are
+# stripped first; a word that is part of the matched product's own name does
+# not count.
+_COND_W = r"(?:rips?|tears?|damages?|damaged?|dmg|dents?|dings?|creases?|holes?|flaws?|wear|issues?)"
+_COND_NEG_RE = re.compile(
+    r"\b(?:no|not|non|never|without|zero|0|w/o)\s+(?:(?:box|shelf|corner|visible|major|minor|any|known)\s+){0,2}"
+    + _COND_W + r"(?:(?:\s*(?:,\s*(?:or|and)?|/|or|and|&)\s*|\s+)" + _COND_W + r")*"
+    r"|\b" + _COND_W + r"[\s-]free\b"
+    r"|\b(?:never|not|non|un)[\s-]*(?:been\s+)?(?:opened|weighed|damaged|resealed|tampered)\b"
+    r"|\bheavy[\s-]duty\b",
+    re.IGNORECASE,
+)
+_COND_FLAW_RE = re.compile(
+    r"\b(?:torn|tears?|ripped|damages?|damaged|dmg|dents?|dented|denting|dings?|dinged"
+    r"|crushed|creased?|creasing|holes?|resealed|re-sealed|tamper\w*|flaws?|flawed"
+    r"|box\s?wear|shelf\s?wear|imperfect\w*|unsealed|not\s+sealed|no\s+(?:shrink|wrap|seal)"
+    r"|partially\s+open\w*|open\s+box|opened)\b",
+    re.IGNORECASE,
+)
+_COND_WEIGHT_RE = re.compile(
+    r"\b(?:heavy|weighed)\b|\b\d{1,2}\.\d{1,2}\s*g(?:rams?)?\b|\b\d{2}\s*grams?\b",
+    re.IGNORECASE,
+)
+_COND_POINTER_RE = re.compile(
+    r"\bread\b|\b(?:see|check)\s+(?:the\s+)?(?:desc\w*|photos?|pics?|pictures?|listing|details)\b"
+    r"|\bas[\s-]is\b",
+    re.IGNORECASE,
 )
 
 # Tie-break safety: if two products tie on the top match score but their market

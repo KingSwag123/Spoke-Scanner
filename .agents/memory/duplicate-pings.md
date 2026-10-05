@@ -72,3 +72,30 @@ the dev workflow is also running, that's the cause.
 silent) even before a republish; republishing then carries the guard to prod, which
 keeps posting because `REPLIT_DEPLOYMENT=1` there. Runtime state must never be a
 tracked artifact shared across environments.
+
+## Repeat limit for sealed products (owner decision, 2026-10-05)
+
+The rule above ("eBay multi-seller is legit, never collapse") still holds for
+dedup by listing id, but the owner chose to LIMIT how often one sealed catalog
+product alerts: its first 3 alerts in 24h post as usual, after that only a
+listing cheaper than everything already posted for it in the window
+(`config.SEALED_REPEAT_FREE`, `SEALED_REPEAT_WINDOW`, `api_engines.repeat_allowed`,
+state in `product_alerts.json`). Do not remove it as a "collapse" bug.
+
+**Why:** hot products (a new set's ETB) produced dozens of alerts a day that all
+cleared the deal test because the catalog price sat above the going price —
+1,117 of 5,044 sealed alerts in 30 days were seven products. Replayed, the limit
+kept the day's cheapest listing of a product on 97% of days.
+
+**How to apply:** the limit runs LAST in the sealed branch, after every guard
+that can drop a listing, so a dropped listing never uses a slot or sets the low.
+Listings with a condition note are keyed apart (`|caveat`). It must fail open.
+
+## Dedup state is in PostgreSQL too (2026-10-05)
+
+`seen_listings.json` did not survive republishes (554 duplicate alerts in 30
+days, mostly one week with seven publishes). `scanner_state.py` mirrors the ids
+into table `scanner_seen` (in `database/watchlist_schema.sql`); `main.load_seen`
+unions file + table on the live instance. It fails soft to the file if the table
+is missing. The TCGplayer "best price already alerted" baseline is rebuilt from
+those ids at startup (`tcgplayer_source.seed_best_emitted`).
