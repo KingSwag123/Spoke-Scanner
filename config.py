@@ -102,7 +102,10 @@ GAME_STREAMS = {
         "one piece card single",
         "one piece tcg card",
         "one piece booster box",
-        "one piece booster case",
+        # Was "one piece booster case": case products are excluded from the
+        # sealed index as bulk, so that stream could never alert. Valuable
+        # singles are alternate arts, which sellers label this way.
+        "one piece card alt art",
     ],
     "yugioh": [
         "yugioh card single",
@@ -630,7 +633,51 @@ TCGCSV_CATEGORY = {"pokemon": 3, "mtg": 1, "lorcana": 71, "onepiece": 68,
                    "yugioh": 2,
                    "pokemon_jp": 85}
 TCGCSV_ONEPIECE_CAT   = TCGCSV_CATEGORY["onepiece"]
-_OP_CODE_RE           = re.compile(r"\b((?:OP|ST|EB|PRB)\d{2}-\d{3})\b", re.IGNORECASE)
+_OP_CODE_RE           = re.compile(r"\b((?:OP|ST|EB|PRB)\d{2}-\d{3}|P-\d{3})\b", re.IGNORECASE)
+
+# One Piece: one card code covers several PRINTINGS at very different prices
+# (OP05-010 is a 14-cent base card and a $309 alternate art), and the catalog
+# prices most valuable printings only under "Foil". Each printing's name says
+# what it is in brackets — "(Alternate Art)", "(Manga)", "(Judge Pack Vol. 3)".
+# These regexes turn that wording, and the same wording in a listing title, into
+# tags, so a listing is priced against the printing its title describes.
+_OP_VARIANT_TAGS = (
+    ("superalt",   re.compile(r"\bsuper\s+(?:alt(?:ernate)?|parallel)\b", re.I)),
+    ("alt",        re.compile(r"\balt(?:ernate)?[\s-]*art\b|\bparallel\b|\baa\b", re.I)),
+    ("manga",      re.compile(r"\bmanga\b", re.I)),
+    ("sp",         re.compile(r"\bsp\b", re.I)),
+    ("gold",       re.compile(r"\bgold\b", re.I)),
+    ("textured",   re.compile(r"\btextured\b", re.I)),
+    ("fullart",    re.compile(r"\bfull[\s-]*art\b", re.I)),
+    ("piratefoil", re.compile(r"\bpirate\s+foil\b", re.I)),
+    ("jollyroger", re.compile(r"\bjolly\s+roger\b", re.I)),
+    ("boxtopper",  re.compile(r"\bbox\s+topper\b", re.I)),
+    ("wanted",     re.compile(r"\bwanted\s+poster\b", re.I)),
+    ("treasure",   re.compile(r"\btreasure\s+cup\b", re.I)),
+    ("judge",      re.compile(r"\bjudge\b", re.I)),
+    ("winner",     re.compile(r"\bwinner\b", re.I)),
+    ("finalist",   re.compile(r"\bfinalist\b", re.I)),
+    ("participant", re.compile(r"\bparticipa(?:nt|tion)\b", re.I)),
+    ("tournament", re.compile(r"\btournament\b", re.I)),
+    ("regional",   re.compile(r"\bregionals?\b", re.I)),
+    ("championship", re.compile(r"\bchampionships?\b|\bcs\b", re.I)),
+    ("prerelease", re.compile(r"\bpre[\s-]?release\b", re.I)),
+    ("releaseevent", re.compile(r"\brelease\s+event\b", re.I)),
+    ("anniversary", re.compile(r"\banniversary\b", re.I)),
+    ("serial",     re.compile(r"\bserial(?:ized|ised)?\b", re.I)),
+    # In titles only — no catalog printing is signed, so these never match one.
+    ("signed",     re.compile(r"\bsigned\b|\bautograph\w*\b|\bsignature\b", re.I)),
+)
+# A reprint is the same card at the same or a lower price and sellers rarely say
+# so; it never has to be named in the title.
+_OP_SOFT_DESCRIPTOR_RE = re.compile(r"\breprint\b", re.I)
+# Bracketed text that is not a variant: a bare number or the card code itself.
+_OP_PLAIN_DESCRIPTOR_RE = re.compile(r"^(?:\d+|(?:OP|ST|EB|PRB)\d{2}-\d{3}|P-\d{3}|ST-?\d+)$", re.I)
+# Words in a printing's bracket text that need not appear in a listing title.
+_OP_DESCRIPTOR_NOISE = {
+    "vol", "pack", "packs", "the", "ver", "version", "card", "cards", "set", "edition",
+    "one", "piece", "and", "of", "in", "for", "deck", "collection", "promo", "promotion",
+}
 _YUGIOH_CODE_RE       = re.compile(
     # Covers legacy LOB-001 / modern RA01-EN001 and Speed Duel SS04-ENA01
     # forms. A regex hit is only a parser candidate; pricing still requires an

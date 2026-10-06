@@ -49,6 +49,10 @@ from config import (
     _ONEPIECE_INDEX_RETRY,
     _ONEPIECE_INDEX_TTL,
     _OP_CODE_RE,
+    _OP_DESCRIPTOR_NOISE,
+    _OP_PLAIN_DESCRIPTOR_RE,
+    _OP_SOFT_DESCRIPTOR_RE,
+    _OP_VARIANT_TAGS,
     _OPENED_CONDITION_RE,
     _OVERSIZE_INDICATORS,
     _PRESALE_RE,
@@ -660,37 +664,88 @@ def fetch_lorcana_price(tokens: list[str], title: str):
     return _progressive_price(tokens, lambda n: _lorcast_one(n, foil), f"lorcana{'F' if foil else ''}")
 
 
-# One Piece price index (tcgcsv category 68). See config for the category id and
-# matching regex. We build {card_code: (name, market_price)} once per TTL window.
+# One Piece price index (tcgcsv category 68). See config for the category id,
+# the code regex and the variant vocabulary. Built once per TTL window as
+#   {card_code: [(market_price, printing_name, tags, words), ...]}
+# with every printing of the code: `tags` are the variant tags its name states
+# and `words` any other bracketed words a title must repeat.
 _op_index: dict       = {}
 _op_index_until: float = 0.0       # monotonic deadline; rebuild only once it passes
 
 
-def _build_onepiece_index() -> dict:
-    """Build {card_code: (name, market_price)} from tcgcsv One Piece data."""
-    base  = f"https://tcgcsv.com/tcgplayer/{TCGCSV_ONEPIECE_CAT}"
-    index: dict = {}
-    try:
-        groups = requests.get(f"{base}/groups", headers=_HTTP_HEADERS, timeout=15).json().get("results", [])
-    except (requests.RequestException, ValueError) as e:
-        print(f"  [WARN] tcgcsv groups fetch failed: {e}")
-        return index
-    results, _complete = _fetch_all_groups(base, groups, "One Piece index")
+def _op_tags(text: str) -> frozenset:
+    """Variant tags (config._OP_VARIANT_TAGS) stated in a title or bracket text."""
+    return frozenset(tag for tag, rx in _OP_VARIANT_TAGS if rx.search(text))
+
+
+def _op_descriptors(name: str) -> list[str]:
+    """The bracketed parts of a printing name that could describe a variant."""
+    return [d.strip() for d in re.findall(r"[\(\[]([^\)\]]+)[\)\]]", _ascii(name))
+            if not _OP_PLAIN_DESCRIPTOR_RE.match(d.strip())]
+
+
+def _op_index_from(results: list) -> dict:
+    """Fold fetched (group, products, prices) triples into the printing index."""
+    raw: dict = {}                  # code -> [(price, name, [descriptor, ...])]
     for _g, prods, prices in results:
-        pmap = {
-            p.get("productId"): p["marketPrice"]
-            for p in prices
-            if p.get("subTypeName") == "Normal" and p.get("marketPrice")
-        }
+        # Most valuable One Piece printings are priced ONLY under "Foil"; take
+        # the lowest market across subtypes (conservative, as the Japanese
+        # Pokemon index does).
+        pmap: dict = {}
+        for p in prices:
+            mp = p.get("marketPrice")
+            if not mp:
+                continue
+            try:
+                mp = float(mp)
+            except (TypeError, ValueError):
+                continue
+            pid = p.get("productId")
+            pmap[pid] = mp if pid not in pmap else min(pmap[pid], mp)
         for prod in prods:
             num = next((e["value"] for e in prod.get("extendedData", []) if e.get("name") == "Number"), None)
             mp  = pmap.get(prod.get("productId"))
             if num and mp:
-                try:
-                    index[num.upper()] = (prod.get("name", num), float(mp))
-                except (TypeError, ValueError):
-                    pass
+                name = prod.get("name", num)
+                raw.setdefault(num.upper(), []).append((mp, name, _op_descriptors(name)))
+    index: dict = {}
+    for code, printings in raw.items():
+        # Bracket text carried by EVERY printing of a code is part of the card's
+        # name ("Mr.2.Bon.Kurei (Bentham)"), not a variant.
+        shared = set.intersection(*(set(d.lower() for d in descs) for _p, _n, descs in printings)) \
+            if len(printings) > 1 else set()
+        entries = []
+        for price, name, descs in printings:
+            tags: set = set()
+            words: set = set()
+            for d in descs:
+                if d.lower() in shared or _OP_SOFT_DESCRIPTOR_RE.search(d):
+                    continue
+                found = _op_tags(d)
+                if found:
+                    tags |= found
+                else:
+                    words |= {w for w in re.findall(r"[a-z0-9]+", d.lower())
+                              if len(w) >= 3 and w not in _OP_DESCRIPTOR_NOISE and not w.isdigit()}
+            # A word that is also in the card's own name ("(Ace Deck)" on
+            # Portgas.D.Ace) is in every title for the card and tells nothing.
+            own = set(re.findall(r"[a-z0-9]+", re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", _ascii(name)).lower()))
+            words -= own
+            entries.append((price, name, frozenset(tags), frozenset(words)))
+        index[code] = entries
     return index
+
+
+def _build_onepiece_index() -> dict:
+    """Build the One Piece printing index from tcgcsv data."""
+    base  = f"https://tcgcsv.com/tcgplayer/{TCGCSV_ONEPIECE_CAT}"
+    try:
+        groups = requests.get(f"{base}/groups", headers=_HTTP_HEADERS, timeout=15).json().get("results", [])
+    except (requests.RequestException, ValueError) as e:
+        print(f"  [WARN] tcgcsv groups fetch failed: {e}")
+        return {}
+    results, _complete = _fetch_all_groups(base, groups, "One Piece index")
+    return _op_index_from(results)
 
 
 def _onepiece_index() -> dict:
@@ -709,7 +764,8 @@ def _onepiece_index() -> dict:
     idx = _build_onepiece_index()
     if idx:
         _op_index, _op_index_until = idx, now + _ONEPIECE_INDEX_TTL
-        print(f"[INFO] One Piece index ready — {len(idx)} cards priced")
+        print(f"[INFO] One Piece index ready — {len(idx)} card codes, "
+              f"{sum(len(v) for v in idx.values())} printings priced")
     else:
         _op_index_until = now + _ONEPIECE_INDEX_RETRY
         print(f"[WARN] One Piece index build returned no data; backing off "
@@ -717,14 +773,43 @@ def _onepiece_index() -> dict:
     return _op_index
 
 
-def fetch_onepiece_price(code: str, title: str):
-    idx = _onepiece_index()
-    entry = idx.get(code) if idx else None
-    if not entry:
+def _op_pick_printing(printings: list, title: str):
+    """Choose the printing a listing title describes, or None when it cannot be
+    told. A printing fits when the title states every variant its name does;
+    the most specific fit wins, and among equals the CHEAPEST — a wrong guess
+    then understates the card's value (a missed deal) rather than inventing one.
+    A title that claims a variant no fitting printing has (alt art, signed, …)
+    is not priced at all."""
+    title_tags = _op_tags(title)
+    title_words = set(re.findall(r"[a-z0-9]+", title.lower()))
+
+    def explains_title(p) -> bool:
+        left = title_tags - p[2]
+        # Sellers add "alt art" to any special printing ("Manga Alt Art", "SP
+        # Parallel"); a special printing accounts for the word.
+        if p[2]:
+            left = left - {"alt"}
+        return not left
+
+    fits = [p for p in printings
+            if p[2] <= title_tags and p[3] <= title_words and explains_title(p)]
+    if not fits:
         return None
-    # The index stores (name, market_price); callers expect (market_price, name).
-    name, market_price = entry
-    return market_price, name
+    top = max(len(p[2]) + len(p[3]) for p in fits)
+    return min((p for p in fits if len(p[2]) + len(p[3]) == top), key=lambda p: (p[0], p[1]))
+
+
+def fetch_onepiece_price(code: str, title: str):
+    """(market_price, printing_name) for a One Piece single, or None."""
+    # The catalog is English product; a Japanese copy is a different, cheaper card.
+    if detect_language(title) == "Japanese":
+        return None
+    idx = _onepiece_index()
+    printings = idx.get(code) if idx else None
+    if not printings:
+        return None
+    best = _op_pick_printing(printings, _ascii(title))
+    return (best[0], best[1]) if best else None
 
 
 # Yu-Gi-Oh singles are identified by their printed set code (LOB-001,
