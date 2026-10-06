@@ -1282,7 +1282,12 @@ def _sealed_title_is_partial(title: str, title_toks: set, product_toks: frozense
     or a small pack count on a booster box. Only booster boxes: an Elite Trainer
     Box really does hold "9 packs"."""
     words = title_toks | ({"elite"} if "etb" in title_toks else set())
-    if (words & _SEALED_PARTIAL_TOKENS) - product_toks:
+    other = (words & _SEALED_PARTIAL_TOKENS) - product_toks
+    # "bundle" is also a verb in seller chatter ("DM to bundle!"); it only means
+    # another product when the match is a plain booster box.
+    if "bundle" in other and not {"booster", "box"} <= product_toks:
+        other = other - {"bundle"}
+    if other:
         return True
     # Collector Booster Boxes genuinely hold as few as 4 packs, and a Half
     # Booster Box 18.

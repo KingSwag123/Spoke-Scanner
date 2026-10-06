@@ -105,6 +105,12 @@ class OtherFormAndLotTests(SealedIndexCase):
             "Awakening of the New Era - Booster Box",
         )
 
+    def test_bundle_as_seller_chatter_does_not_block_another_product(self):
+        self.assertEqual(
+            self.price("NEW RELEASE!!! Pokémon Ascended Heroes Elite Trainer Box!!! DM To Bundle!!!")[1],
+            "Ascended Heroes Elite Trainer Box",
+        )
+
     def test_lots_are_not_priced_as_one_unit(self):
         for title in (
             "Pokémon Mega Evolution Ascended Heroes Elite Trainer Box Lot of 2 Dragonite",
@@ -360,13 +366,30 @@ class DurableSeenStoreTests(unittest.TestCase):
                 scanner_state.add_seen({"v1|1|0": "2026-10-01T12:00:00+00:00"})
         self.assertFalse(scanner_state._available)
 
+    def test_reconnect_recovers_after_a_bad_start(self):
+        from datetime import datetime, timezone
+        when = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+        conn = self.connection([("old", when)])
+        seen = {"new": "2026-10-05T12:00:00+00:00"}
+        with patch.object(scanner_state, "_connect", return_value=conn):
+            scanner_state.reconnect(seen, 90)
+        self.assertTrue(scanner_state._available)
+        self.assertEqual(set(seen), {"old", "new"})          # adopted what was stored
+        stored = conn.cursor.return_value.executemany.call_args.args[1]
+        self.assertEqual([k for k, _ in stored], ["new"])    # and stored what was missing
+
+    def test_reconnect_is_silent_while_the_database_is_down(self):
+        with patch.object(scanner_state, "_connect", side_effect=RuntimeError("down")):
+            scanner_state.reconnect({"a": "2026-10-05T12:00:00+00:00"}, 90)
+        self.assertFalse(scanner_state._available)
+
     def test_write_inserts_each_id(self):
         scanner_state._available = True
         conn = self.connection()
         with patch.object(scanner_state, "_connect", return_value=conn):
             scanner_state.add_seen({"a": "2026-10-01T12:00:00+00:00", "b": "2026-10-02T12:00:00+00:00"})
         sql, params = conn.cursor.return_value.executemany.call_args.args
-        self.assertIn("ON CONFLICT (item_id) DO NOTHING", sql)
+        self.assertIn("ON CONFLICT (item_id) DO UPDATE SET seen_at", sql)
         self.assertEqual(len(params), 2)
 
 

@@ -126,6 +126,10 @@ JP_MARKET_SOURCES = {"mercari_jp", "yahoo_jp"}
 
 # Shown under the headline of a sealed alert whose title carries a condition
 # note (api_engines.sealed_condition_caveat). The listing still posts.
+# Listings passed over by the repeat limit this process: item_id -> the total it
+# was judged at. In memory only; after a restart they are simply judged again.
+_repeat_hidden: dict[str, float] = {}
+
 _CAVEAT_NOTES = {
     "flaw":    "Seller's title mentions damage or an opened seal",
     "weight":  "Seller's title says the pack was weighed",
@@ -596,6 +600,9 @@ def scan_open_market(
                 # runs last so a listing dropped above never uses one of the
                 # product's slots or sets its low. A listing with a condition note
                 # is keyed apart: a damaged box must not hide clean ones.
+                if total >= _repeat_hidden.get(item_id, float("inf")):
+                    drop["repeat"] += 1     # already passed over at this price
+                    continue
                 pkey = (("pokemon_jp" if item.get("source") in JP_MARKET_SOURCES else game)
                         + "|" + matched_name + ("|caveat" if caveat else ""))
                 try:
@@ -606,10 +613,12 @@ def scan_open_market(
                 if not repeat_ok:
                     drop["repeat"] += 1
                     print(f"  [REPEAT]  ${total:.2f} not below today's alerts — {matched_name[:40]}")
-                    # Judged once. A Shopify variant keeps its id while it stays
-                    # in stock, so leave it free to post when a slot opens.
-                    if item.get("source") != "shopify":
-                        mark_seen(item_id, seen)
+                    # Not marked seen: a listing id keeps its id when the seller
+                    # cuts the price, and a cut can make it the new low. It is
+                    # only passed over while its total stays where it was.
+                    if len(_repeat_hidden) > 20_000:
+                        _repeat_hidden.clear()
+                    _repeat_hidden[item_id] = total
                     continue
                 print(f"  [SEALED] ${total:.2f} vs mkt ${market_price:.2f} → #{game}/{channel} — {title[:48]}")
                 sent = send_sealed_alert(
@@ -865,6 +874,9 @@ def main() -> None:
 
     while True:
         try:
+            # The database may have been unreachable at startup or since.
+            if POST_TO_DISCORD:
+                scanner_state.reconnect(seen, SEEN_EXPIRY_DAYS)
             seen = cleanup_seen(seen)
             availability = cleanup_availability(availability)
             scan_open_market(seen, availability, watchlist_bot, product_alerts)

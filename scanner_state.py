@@ -46,6 +46,28 @@ def load_seen(expiry_days: int) -> dict | None:
     return {item_id: seen_at.isoformat() for item_id, seen_at in rows}
 
 
+def reconnect(seen: dict, expiry_days: int) -> None:
+    """If the store is unavailable (cold database or missing table at startup,
+    or writes paused after failures), try again quietly; once it answers, store
+    everything alerted in the meantime and adopt ids it already holds. Without
+    this one bad start would leave the whole run's alerts only in the file."""
+    global _available, _failures
+    if _available:
+        return
+    try:
+        with _connect() as conn:
+            rows = conn.execute("SELECT item_id, seen_at FROM scanner_seen").fetchall()
+    except Exception:
+        return
+    _available, _failures = True, 0
+    stored = {item_id: seen_at.isoformat() for item_id, seen_at in rows}
+    add_seen({k: v for k, v in seen.items() if k not in stored})
+    for item_id, stamp in stored.items():
+        seen.setdefault(item_id, stamp)
+    print(f"[STATE] dedup database reachable again — {len(stored)} id(s) stored, "
+          f"{len(seen) - len(stored)} added from this run")
+
+
 def add_seen(entries: dict) -> None:
     """Store {item_id: iso_timestamp} entries. Never raises."""
     global _available, _failures
@@ -56,7 +78,7 @@ def add_seen(entries: dict) -> None:
             with conn.cursor() as cur:
                 cur.executemany(
                     "INSERT INTO scanner_seen (item_id, seen_at) VALUES (%s, %s::timestamptz) "
-                    "ON CONFLICT (item_id) DO NOTHING",
+                    "ON CONFLICT (item_id) DO UPDATE SET seen_at = EXCLUDED.seen_at",
                     list(entries.items()),
                 )
         _failures = 0
